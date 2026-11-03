@@ -13,10 +13,11 @@ import { Combobox } from "@headlessui/react";
 // i18n
 import { useTranslation } from "@plane/i18n";
 import { SearchIcon } from "@plane/propel/icons";
+import { Tooltip } from "@plane/propel/tooltip";
 // types
 import type { ISearchIssueResponse } from "@plane/types";
 // ui
-import { Loader, EModalPosition, EModalWidth, ModalCore } from "@plane/ui";
+import { Loader, EModalPosition, EModalWidth, ModalCore, ToggleSwitch } from "@plane/ui";
 import { generateWorkItemLink, getTabIndex } from "@plane/utils";
 // components
 import { IssueSearchModalEmptyState } from "@/components/core/modals/issue-search-modal-empty-state";
@@ -35,6 +36,8 @@ type Props = {
   projectId: string | undefined;
   issueId?: string;
   searchEpic?: boolean;
+  /** Show a toggle that widens the search to every project in the workspace. Defaults to true. */
+  workspaceLevelToggle?: boolean;
 };
 
 // services
@@ -48,6 +51,7 @@ export function ParentIssuesListModal({
   projectId,
   issueId,
   searchEpic = false,
+  workspaceLevelToggle = true,
 }: Props) {
   // i18n
   const { t } = useTranslation();
@@ -56,6 +60,7 @@ export function ParentIssuesListModal({
   const [searchTerm, setSearchTerm] = useState("");
   const [issues, setIssues] = useState<ISearchIssueResponse[]>([]);
   const [isSearching, setIsSearching] = useState(false);
+  const [isWorkspaceLevel, setIsWorkspaceLevel] = useState(false);
   const { isMobile } = usePlatformOS();
   const debouncedSearchTerm: string = useDebounce(searchTerm, 500);
 
@@ -79,7 +84,7 @@ export function ParentIssuesListModal({
         search: debouncedSearchTerm,
         parent: searchEpic ? undefined : true,
         issue_id: issueId,
-        workspace_search: false,
+        workspace_search: workspaceLevelToggle ? isWorkspaceLevel : false,
         epic: searchEpic ? true : undefined,
       })
       .then((res) => setIssues(res))
@@ -87,7 +92,7 @@ export function ParentIssuesListModal({
         setIsSearching(false);
         setIsLoading(false);
       });
-  }, [debouncedSearchTerm, isOpen, issueId, projectId, workspaceSlug]);
+  }, [debouncedSearchTerm, isOpen, issueId, projectId, workspaceSlug, isWorkspaceLevel, workspaceLevelToggle]);
 
   return (
     <ModalCore isOpen={isOpen} handleClose={handleClose} position={EModalPosition.CENTER} width={EModalWidth.XXL}>
@@ -112,6 +117,26 @@ export function ParentIssuesListModal({
             tabIndex={baseTabIndex}
           />
         </div>
+        {workspaceLevelToggle && (
+          <div className="flex items-center justify-end px-3 pb-2">
+            <Tooltip tooltipContent={t("common.workspace_level")} isMobile={isMobile}>
+              <div
+                className={`flex flex-shrink-0 cursor-pointer items-center gap-1 text-11 ${
+                  isWorkspaceLevel ? "text-primary" : "text-secondary"
+                }`}
+              >
+                <ToggleSwitch value={isWorkspaceLevel} onChange={() => setIsWorkspaceLevel((prevData) => !prevData)} />
+                <button
+                  type="button"
+                  onClick={() => setIsWorkspaceLevel((prevData) => !prevData)}
+                  className="flex-shrink-0"
+                >
+                  {t("common.workspace_level")}
+                </button>
+              </div>
+            </Tooltip>
+          </div>
+        )}
         <Combobox.Options static className="vertical-scrollbar scrollbar-md max-h-80 scroll-py-2 overflow-y-auto">
           {searchTerm !== "" && (
             <h5 className="mx-2 text-13 text-secondary">
@@ -121,7 +146,7 @@ export function ParentIssuesListModal({
                 {searchTerm}
                 {'"'}
               </span>{" "}
-              in project:
+              {isWorkspaceLevel ? "in workspace:" : "in project:"}
             </h5>
           )}
 

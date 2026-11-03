@@ -32,6 +32,7 @@ from plane.utils.content_validator import (
     validate_binary_data,
 )
 
+from plane.utils.issue_parent import validate_parent_issue
 from .base import BaseSerializer
 from .cycle import CycleLiteSerializer, CycleSerializer
 from .module import ModuleLiteSerializer, ModuleSerializer
@@ -139,16 +140,14 @@ class IssueSerializer(BaseSerializer):
         ):
             raise serializers.ValidationError("State is not valid please pass a valid state_id")
 
-        # Check parent issue is from workspace as it can be cross workspace
-        if (
-            data.get("parent")
-            and not Issue.objects.filter(
-                workspace_id=self.context.get("workspace_id"),
-                project_id=self.context.get("project_id"),
-                pk=data.get("parent").id,
-            ).exists()
-        ):
-            raise serializers.ValidationError("Parent is not valid issue_id please pass a valid issue_id")
+        # Parent may live in another project of the same workspace
+        if data.get("parent"):
+            validate_parent_issue(
+                data.get("parent"),
+                self.context.get("project_id"),
+                user_id=self.context.get("user_id"),
+                instance=self.instance,
+            )
 
         if (
             data.get("estimate_point")

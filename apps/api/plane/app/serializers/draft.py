@@ -28,6 +28,7 @@ from plane.utils.content_validator import (
     validate_binary_data,
 )
 from plane.app.permissions import ROLE
+from plane.utils.issue_parent import validate_parent_issue
 
 
 class DraftIssueCreateSerializer(BaseSerializer):
@@ -118,15 +119,13 @@ class DraftIssueCreateSerializer(BaseSerializer):
         ):
             raise serializers.ValidationError("State is not valid please pass a valid state_id")
 
-        # # Check parent issue is from workspace as it can be cross workspace
-        if (
-            attrs.get("parent")
-            and not Issue.objects.filter(
-                project_id=self.context.get("project_id"),
-                pk=attrs.get("parent").id,
-            ).exists()
-        ):
-            raise serializers.ValidationError("Parent is not valid issue_id please pass a valid issue_id")
+        # Parent may live in another project of the same workspace
+        if attrs.get("parent"):
+            validate_parent_issue(
+                attrs.get("parent"),
+                self.context.get("project_id"),
+                user_id=self.context.get("user_id"),
+            )
 
         if (
             attrs.get("estimate_point")

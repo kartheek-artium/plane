@@ -42,11 +42,15 @@ export const IssueParentSelectRoot = observer(function IssueParentSelectRoot(pro
   const issue = getIssueById(issueId);
   const parentIssue = issue?.parent_id ? getIssueById(issue.parent_id) : undefined;
 
-  const handleParentIssue = async (_issueId: string | null = null) => {
+  const handleParentIssue = async (_issueId: string | null = null, _parentProjectId: string | null = null) => {
     try {
       await issueOperations.update(workspaceSlug, projectId, issueId, { parent_id: _issueId });
       await issueOperations.fetch(workspaceSlug, projectId, issueId, false);
-      if (_issueId) await fetchSubIssues(workspaceSlug, projectId, _issueId);
+      if (_issueId) {
+        // the parent may live in another project; fetch its sub work items under its own project
+        const parentProjectId = _parentProjectId ?? getIssueById(_issueId)?.project_id ?? projectId;
+        await fetchSubIssues(workspaceSlug, parentProjectId, _issueId);
+      }
       toggleParentIssueModal(null);
     } catch (_error) {
       console.error("something went wrong while fetching the issue");

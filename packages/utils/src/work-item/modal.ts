@@ -17,6 +17,8 @@ export const getUpdateFormDataForReset = (projectId: string | null | undefined, 
   priority: formData.priority,
   start_date: formData.start_date,
   target_date: formData.target_date,
+  // parent work items can live in another project of the workspace, so keep the selection
+  parent_id: formData.parent_id,
 });
 
 export const convertWorkItemDataToSearchResponse = (
