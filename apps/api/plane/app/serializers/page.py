@@ -24,6 +24,7 @@ from plane.db.models import (
 
 class PageSerializer(BaseSerializer):
     is_favorite = serializers.BooleanField(read_only=True)
+    sub_pages_count = serializers.IntegerField(read_only=True, required=False)
     labels = serializers.ListField(
         child=serializers.PrimaryKeyRelatedField(queryset=Label.objects.all()),
         write_only=True,
@@ -55,6 +56,8 @@ class PageSerializer(BaseSerializer):
             "logo_props",
             "label_ids",
             "project_ids",
+            "sub_pages_count",
+            "sort_order",
         ]
         read_only_fields = ["workspace", "owned_by"]
 

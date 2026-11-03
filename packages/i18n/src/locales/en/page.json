@@ -26,6 +26,14 @@
           "highlight_changes": "Highlight changes"
         }
       },
+      "sub_pages": {
+        "label": "Sub-pages",
+        "add_button": "Add sub-page",
+        "empty_state": {
+          "title": "No sub-pages yet",
+          "description": "Break this page into smaller pages. They'll show up nested under it."
+        }
+      },
       "assets": {
         "label": "Assets",
         "download_button": "Download",

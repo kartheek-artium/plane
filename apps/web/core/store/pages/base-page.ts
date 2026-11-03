@@ -12,11 +12,13 @@ import type { TChangeHandlerProps } from "@plane/propel/emoji-icon-picker";
 import type { TDocumentPayload, TLogoProps, TNameDescriptionLoader, TPage } from "@plane/types";
 // plane web store
 import { ExtendedBasePage } from "@/store/pages/extended-base-page";
+import type { TExtendedPageInstance } from "@/store/pages/extended-base-page";
 import type { RootStore } from "@/store/root.store";
 // local imports
 import { PageEditorInstance } from "./page-editor-info";
 
-export type TBasePage = TPage & {
+export type TBasePage = TPage &
+  TExtendedPageInstance & {
   // observables
   isSubmitting: TNameDescriptionLoader;
   isSyncingWithServer: "syncing" | "synced" | "error";
@@ -420,12 +422,30 @@ export class BasePage extends ExtendedBasePage implements TBasePage {
           this.archived_at = response.archived_at;
         });
       }
+      // the backend archives the whole subtree; mirror that for nested pages already in the store
+      this.syncDescendantsArchivedAt(this.archived_at ?? new Date().toISOString());
     } catch (error) {
       console.error(error);
       runInAction(() => {
         this.archived_at = null;
       });
     }
+  };
+
+  /**
+   * @description apply an archived_at value to every loaded descendant (nested pages)
+   */
+  private syncDescendantsArchivedAt = (archivedAt: string | null) => {
+    if (!this.id) return;
+    const pages = this.rootStore.projectPages;
+    if (!pages?.getPageDescendantIds) return;
+    const descendantIds = pages.getPageDescendantIds(this.id);
+    runInAction(() => {
+      descendantIds.forEach((id) => {
+        const descendant = pages.getPageById(id);
+        if (descendant) descendant.archived_at = archivedAt;
+      });
+    });
   };
 
   /**
@@ -442,6 +462,12 @@ export class BasePage extends ExtendedBasePage implements TBasePage {
       if (shouldSync) {
         await this.services.restore();
       }
+      // the backend restores the whole subtree and detaches this page from a still-archived parent
+      this.syncDescendantsArchivedAt(null);
+      runInAction(() => {
+        const parentId = this.parent ?? null;
+        if (parentId && this.rootStore.projectPages?.getPageById(parentId)?.archived_at) this.parent = null;
+      });
     } catch (error) {
       console.error(error);
       runInAction(() => {

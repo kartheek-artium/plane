@@ -19,6 +19,7 @@ from django.db.models import (
     Case,
     When,
     IntegerField,
+    Subquery,
 )
 from django.http import StreamingHttpResponse
 from django.contrib.postgres.aggregates import ArrayAgg
@@ -73,6 +74,70 @@ def unarchive_archive_page_and_descendants(page_id, archived_at):
         cursor.execute(sql, [page_id, archived_at])
 
 
+def get_page_descendant_ids(page_id):
+    """Return ids of every page below ``page_id`` (excluding itself), including soft-deleted rows."""
+    sql = """
+    WITH RECURSIVE descendants AS (
+        SELECT id, 0 AS depth FROM pages WHERE id = %s
+        UNION ALL
+        SELECT pages.id, descendants.depth + 1
+        FROM pages, descendants
+        WHERE pages.parent_id = descendants.id AND descendants.depth < 100
+    )
+    SELECT id FROM descendants WHERE id != %s;
+    """
+    with connection.cursor() as cursor:
+        cursor.execute(sql, [page_id, page_id])
+        return [str(row[0]) for row in cursor.fetchall()]
+
+
+def get_page_ancestors(page_id):
+    """Return the ancestor chain of ``page_id`` from the root down to the direct parent."""
+    sql = """
+    WITH RECURSIVE ancestors AS (
+        SELECT id, parent_id, name, logo_props, access, archived_at, 0 AS depth
+        FROM pages WHERE id = %s AND deleted_at IS NULL
+        UNION ALL
+        SELECT pages.id, pages.parent_id, pages.name, pages.logo_props, pages.access, pages.archived_at, ancestors.depth + 1
+        FROM pages, ancestors
+        WHERE pages.id = ancestors.parent_id AND pages.deleted_at IS NULL AND ancestors.depth < 100
+    )
+    SELECT id, name, logo_props, access, archived_at FROM ancestors WHERE depth > 0 ORDER BY depth DESC;
+    """
+    with connection.cursor() as cursor:
+        cursor.execute(sql, [page_id])
+        rows = cursor.fetchall()
+    return [
+        {"id": str(r[0]), "name": r[1], "logo_props": r[2] if isinstance(r[2], dict) else json.loads(r[2] or "{}"),
+         "access": r[3], "archived_at": r[4]}
+        for r in rows
+    ]
+
+
+def validate_page_parent(parent_id, slug, project_id, page=None):
+    """
+    Validate that ``parent_id`` can be the parent of ``page`` (None when creating).
+    Returns (parent, error_message). Rules: same project, not archived, not self,
+    not one of the page's own descendants.
+    """
+    parent = Page.objects.filter(
+        pk=parent_id,
+        workspace__slug=slug,
+        projects__id=project_id,
+        project_pages__deleted_at__isnull=True,
+    ).first()
+    if parent is None:
+        return None, "Parent page not found in this project"
+    if parent.archived_at is not None:
+        return None, "Cannot nest a page under an archived page"
+    if page is not None:
+        if str(parent.id) == str(page.id):
+            return None, "A page cannot be its own parent"
+        if str(parent.id) in get_page_descendant_ids(page.id):
+            return None, "Cannot move a page under one of its own sub-pages"
+    return parent, None
+
+
 class PageViewSet(BaseViewSet):
     serializer_class = PageSerializer
     model = Page
@@ -95,7 +160,6 @@ class PageViewSet(BaseViewSet):
                 projects__project_projectmember__is_active=True,
                 projects__archived_at__isnull=True,
             )
-            .filter(parent__isnull=True)
             .filter(Q(owned_by=self.request.user) | Q(access=0))
             .prefetch_related("projects")
             .select_related("workspace")
@@ -137,13 +201,36 @@ class PageViewSet(BaseViewSet):
                     Value([], output_field=ArrayField(UUIDField())),
                 ),
             )
+            .annotate(
+                sub_pages_count=Coalesce(
+                    Subquery(
+                        Page.objects.filter(parent_id=OuterRef("id"), archived_at__isnull=True)
+                        .filter(Q(owned_by=self.request.user) | Q(access=Page.PUBLIC_ACCESS))
+                        .order_by()
+                        .values("parent_id")
+                        .annotate(count=Count("id"))
+                        .values("count"),
+                        output_field=IntegerField(),
+                    ),
+                    0,
+                )
+            )
             .filter(project=True)
             .distinct()
         )
 
     def create(self, request, slug, project_id):
+        data = request.data.copy() if hasattr(request.data, "copy") else dict(request.data)
+        parent_id = data.get("parent", None)
+        if parent_id:
+            parent, error = validate_page_parent(parent_id, slug, project_id)
+            if error:
+                return Response({"error": error}, status=status.HTTP_400_BAD_REQUEST)
+            # a sub-page inherits its parent's visibility unless explicitly set
+            if "access" not in data:
+                data["access"] = parent.access
         serializer = PageSerializer(
-            data=request.data,
+            data=data,
             context={
                 "project_id": project_id,
                 "owned_by_id": request.user.id,
@@ -180,12 +267,9 @@ class PageViewSet(BaseViewSet):
 
             parent = request.data.get("parent", None)
             if parent:
-                _ = Page.objects.get(
-                    pk=parent,
-                    workspace__slug=slug,
-                    projects__id=project_id,
-                    project_pages__deleted_at__isnull=True,
-                )
+                _, error = validate_page_parent(parent, slug, project_id, page=page)
+                if error:
+                    return Response({"error": error}, status=status.HTTP_400_BAD_REQUEST)
 
             # Only update access if the page owner is the requesting  user
             if page.access != request.data.get("access", page.access) and page.owned_by_id != request.user.id:
@@ -305,6 +389,12 @@ class PageViewSet(BaseViewSet):
 
     def list(self, request, slug, project_id):
         queryset = self.get_queryset()
+        # Hierarchy filters. Default returns every page (with its parent id) so clients can build the tree.
+        parent_param = request.query_params.get("parent", None)
+        if parent_param:
+            queryset = queryset.filter(parent_id=parent_param)
+        elif request.query_params.get("root_only", "false").lower() == "true":
+            queryset = queryset.filter(parent__isnull=True)
         project = Project.objects.get(pk=project_id)
         if (
             ProjectMember.objects.filter(
@@ -441,7 +531,6 @@ class PageViewSet(BaseViewSet):
                 projects__project_projectmember__is_active=True,
                 projects__archived_at__isnull=True,
             )
-            .filter(parent__isnull=True)
             .filter(Q(owned_by=request.user) | Q(access=0))
             .annotate(
                 project=Exists(
@@ -482,6 +571,55 @@ class PageViewSet(BaseViewSet):
         )
 
         return Response(stats, status=status.HTTP_200_OK)
+
+    def sub_pages(self, request, slug, project_id, page_id):
+        """Direct children of a page that the requesting user can see."""
+        queryset = self.get_queryset().filter(parent_id=page_id)
+        project = Project.objects.get(pk=project_id)
+        if (
+            ProjectMember.objects.filter(
+                workspace__slug=slug,
+                project_id=project_id,
+                member=request.user,
+                role=ROLE.GUEST.value,
+                is_active=True,
+            ).exists()
+            and not project.guest_view_all_features
+        ):
+            queryset = queryset.filter(owned_by=request.user)
+        return Response(PageSerializer(queryset, many=True).data, status=status.HTTP_200_OK)
+
+    def parents(self, request, slug, project_id, page_id):
+        """Ancestor chain (root first) for breadcrumbs. Only ancestors visible to the user are returned."""
+        queryset = self.get_queryset()
+        project = Project.objects.get(pk=project_id)
+        restricted_guest = (
+            ProjectMember.objects.filter(
+                workspace__slug=slug,
+                project_id=project_id,
+                member=request.user,
+                role=ROLE.GUEST.value,
+                is_active=True,
+            ).exists()
+            and not project.guest_view_all_features
+        )
+        if restricted_guest:
+            queryset = queryset.filter(owned_by=request.user)
+        if not queryset.filter(pk=page_id).exists():
+            return Response({"error": "Page not found"}, status=status.HTTP_404_NOT_FOUND)
+        ancestors = get_page_ancestors(page_id)
+        owned_ids = set(
+            str(i)
+            for i in Page.objects.filter(pk__in=[a["id"] for a in ancestors], owned_by=request.user).values_list(
+                "id", flat=True
+            )
+        )
+        visible = [
+            a
+            for a in ancestors
+            if a["id"] in owned_ids or (not restricted_guest and a["access"] == Page.PUBLIC_ACCESS)
+        ]
+        return Response(visible, status=status.HTTP_200_OK)
 
 
 class PageFavoriteViewSet(BaseViewSet):

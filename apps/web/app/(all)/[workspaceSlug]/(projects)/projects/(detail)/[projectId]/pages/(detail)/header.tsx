@@ -35,13 +35,15 @@ export const PageDetailsHeader = observer(function PageDetailsHeader() {
   const { workspaceSlug, pageId, projectId } = useParams();
   // store hooks
   const { loader } = useProject();
-  const { getPageById, getCurrentProjectPageIds } = usePageStore(storeType);
+  const { getPageById, getCurrentProjectPageIds, getPageAncestorIds } = usePageStore(storeType);
   const page = usePage({
     pageId: pageId?.toString() ?? "",
     storeType,
   });
   // derived values
   const projectPageIds = getCurrentProjectPageIds(projectId?.toString());
+  // nested pages: ancestor chain, root first (only ancestors loaded in the store)
+  const ancestorIds = getPageAncestorIds(pageId?.toString() ?? "");
 
   const switcherOptions = projectPageIds
     .map((id) => {
@@ -77,6 +79,23 @@ export const PageDetailsHeader = observer(function PageDetailsHeader() {
                 />
               }
             />
+
+            {ancestorIds.map((ancestorId) => {
+              const ancestor = getPageById(ancestorId);
+              if (!ancestor) return null;
+              return (
+                <Breadcrumbs.Item
+                  key={ancestorId}
+                  component={
+                    <BreadcrumbLink
+                      label={getPageName(ancestor.name)}
+                      href={`/${workspaceSlug}/projects/${projectId}/pages/${ancestorId}`}
+                      icon={<SwitcherIcon logo_props={ancestor.logo_props} LabelIcon={PageIcon} size={16} />}
+                    />
+                  }
+                />
+              );
+            })}
 
             <Breadcrumbs.Item
               component={

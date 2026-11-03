@@ -29,6 +29,17 @@ urlpatterns = [
         PageViewSet.as_view({"get": "retrieve", "patch": "partial_update", "delete": "destroy"}),
         name="project-pages",
     ),
+    # page hierarchy
+    path(
+        "workspaces/<str:slug>/projects/<uuid:project_id>/pages/<uuid:page_id>/sub-pages/",
+        PageViewSet.as_view({"get": "sub_pages"}),
+        name="project-page-sub-pages",
+    ),
+    path(
+        "workspaces/<str:slug>/projects/<uuid:project_id>/pages/<uuid:page_id>/parents/",
+        PageViewSet.as_view({"get": "parents"}),
+        name="project-page-parents",
+    ),
     # favorite pages
     path(
         "workspaces/<str:slug>/projects/<uuid:project_id>/favorite-pages/<uuid:page_id>/",

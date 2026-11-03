@@ -58,6 +58,15 @@ export const orderPages = (
     orderedPages = sortBy(pages, [(m) => m.updated_at]);
     if (sortByOrder === "desc") orderedPages = orderedPages.reverse();
   }
+  if (sortByKey === "sort_order") {
+    // manual order (drag and drop); pages that were never moved share the default
+    // sort_order, so fall back to newest-first among them
+    orderedPages = sortBy(pages, [
+      (m) => m.sort_order ?? 0,
+      (m) => -(m.created_at ? new Date(m.created_at as unknown as string).getTime() : 0),
+    ]);
+    if (sortByOrder === "desc") orderedPages = orderedPages.reverse();
+  }
 
   return orderedPages;
 };

@@ -77,6 +77,8 @@ export const BlockItemAction = observer(function BlockItemAction(props: Props) {
       {/* quick actions dropdown */}
       <PageActions
         optionsOrder={[
+          "add-sub-page",
+          "move-to-page",
           "open-in-new-tab",
           "copy-link",
           "make-a-copy",

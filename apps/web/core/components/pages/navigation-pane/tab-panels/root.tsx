@@ -12,6 +12,7 @@ import type { TPageInstance } from "@/store/pages/base-page";
 import { PageNavigationPaneAssetsTabPanel } from "./assets";
 import { PageNavigationPaneInfoTabPanel } from "./info/root";
 import { PageNavigationPaneOutlineTabPanel } from "./outline";
+import { PageNavigationPaneSubPagesTabPanel } from "./sub-pages";
 import { Tabs } from "@plane/propel/tabs";
 import { ORDERED_PAGE_NAVIGATION_TABS_LIST } from ".";
 
@@ -29,6 +30,7 @@ export function PageNavigationPaneTabPanelsRoot(props: Props) {
         <Tabs.Content key={tab.key} value={tab.key} className="flex-1 overflow-hidden py-2">
           {tab.key === "outline" && <PageNavigationPaneOutlineTabPanel page={page} />}
           {tab.key === "info" && <PageNavigationPaneInfoTabPanel page={page} versionHistory={versionHistory} />}
+          {tab.key === "sub_pages" && <PageNavigationPaneSubPagesTabPanel page={page} />}
           {tab.key === "assets" && <PageNavigationPaneAssetsTabPanel page={page} />}
         </Tabs.Content>
       ))}
