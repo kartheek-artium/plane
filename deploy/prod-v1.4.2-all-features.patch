@@ -1,0 +1,3444 @@
+From bd9b35c3afc929c3686a3ed40506f3f4d32cab1f Mon Sep 17 00:00:00 2001
+From: Kartheek Nagasuri <kartheek@artiumacademy.com>
+Date: Wed, 28 Oct 2026 13:47:01 +0000
+Subject: [PATCH 1/7] feat: allow parent work items from other projects in the
+ same workspace
+
+Backend
+- Parent validation (app, draft and public API serializers) now checks the
+  parent is in the same workspace instead of the same project, requires the
+  acting user to be a non-guest member of the parent's project when it is in
+  another project, and rejects cycles. Shared helper in plane/utils/issue_parent.py.
+- Sub work items GET returns only children from projects the user is a
+  member of; POST scopes the parent to the workspace/project, excludes the
+  parent and its ancestors, and logs activity under each sub work item's own
+  project with the correct previous parent.
+- Parent search excludes all descendants (not just direct children) and no
+  longer crashes when the issue has no parent.
+
+Frontend
+- Parent picker and "add existing sub work item" modal gain the workspace
+  level toggle.
+- Sub work items are fetched under the parent's own project.
+- parent_id is preserved when switching project in the create modal.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01CiiWKDVmCA9t6snJ82jWR1
+---
+ apps/api/plane/api/serializers/issue.py       | 19 ++--
+ apps/api/plane/api/views/issue.py             |  5 +-
+ apps/api/plane/app/serializers/draft.py       | 17 ++--
+ apps/api/plane/app/serializers/issue.py       | 18 ++--
+ apps/api/plane/app/views/intake/base.py       |  3 +-
+ apps/api/plane/app/views/issue/base.py        |  8 +-
+ apps/api/plane/app/views/issue/sub_issue.py   | 59 +++++++++---
+ apps/api/plane/app/views/search/issue.py      | 10 +-
+ apps/api/plane/app/views/workspace/draft.py   |  3 +
+ apps/api/plane/utils/issue_parent.py          | 91 +++++++++++++++++++
+ .../issue-detail-widget-modals.tsx            |  1 +
+ .../sub-issues/issues-list/list-item.tsx      |  2 +-
+ .../issues/issue-detail/parent-select.tsx     |  4 +-
+ .../issues/parent-issues-list-modal.tsx       | 33 ++++++-
+ .../components/issues/parent-select-root.tsx  |  8 +-
+ packages/utils/src/work-item/modal.ts         |  2 +
+ 16 files changed, 229 insertions(+), 54 deletions(-)
+ create mode 100644 apps/api/plane/utils/issue_parent.py
+
+diff --git a/apps/api/plane/api/serializers/issue.py b/apps/api/plane/api/serializers/issue.py
+index 5a771f2ad..d9300f3f5 100644
+--- a/apps/api/plane/api/serializers/issue.py
++++ b/apps/api/plane/api/serializers/issue.py
+@@ -32,6 +32,7 @@ from plane.utils.content_validator import (
+     validate_binary_data,
+ )
+ 
++from plane.utils.issue_parent import validate_parent_issue
+ from .base import BaseSerializer
+ from .cycle import CycleLiteSerializer, CycleSerializer
+ from .module import ModuleLiteSerializer, ModuleSerializer
+@@ -125,16 +126,14 @@ class IssueSerializer(BaseSerializer):
+         ):
+             raise serializers.ValidationError("State is not valid please pass a valid state_id")
+ 
+-        # Check parent issue is from workspace as it can be cross workspace
+-        if (
+-            data.get("parent")
+-            and not Issue.objects.filter(
+-                workspace_id=self.context.get("workspace_id"),
+-                project_id=self.context.get("project_id"),
+-                pk=data.get("parent").id,
+-            ).exists()
+-        ):
+-            raise serializers.ValidationError("Parent is not valid issue_id please pass a valid issue_id")
++        # Parent may live in another project of the same workspace
++        if data.get("parent"):
++            validate_parent_issue(
++                data.get("parent"),
++                self.context.get("project_id"),
++                user_id=self.context.get("user_id"),
++                instance=self.instance,
++            )
+ 
+         if (
+             data.get("estimate_point")
+diff --git a/apps/api/plane/api/views/issue.py b/apps/api/plane/api/views/issue.py
+index da9edc66d..93a22bda1 100644
+--- a/apps/api/plane/api/views/issue.py
++++ b/apps/api/plane/api/views/issue.py
+@@ -460,6 +460,7 @@ class IssueListCreateAPIEndpoint(BaseAPIView):
+                 "project_id": project_id,
+                 "workspace_id": project.workspace_id,
+                 "default_assignee_id": project.default_assignee_id,
++                "user_id": request.user.id,
+             },
+         )
+ 
+@@ -650,6 +651,7 @@ class IssueDetailAPIEndpoint(BaseAPIView):
+                     context={
+                         "project_id": project_id,
+                         "workspace_id": project.workspace_id,
++                        "user_id": request.user.id,
+                     },
+                     partial=True,
+                 )
+@@ -696,6 +698,7 @@ class IssueDetailAPIEndpoint(BaseAPIView):
+                         "project_id": project_id,
+                         "workspace_id": project.workspace_id,
+                         "default_assignee_id": project.default_assignee_id,
++                        "user_id": request.user.id,
+                     },
+                 )
+ 
+@@ -781,7 +784,7 @@ class IssueDetailAPIEndpoint(BaseAPIView):
+         serializer = IssueSerializer(
+             issue,
+             data=request.data,
+-            context={"project_id": project_id, "workspace_id": project.workspace_id},
++            context={"project_id": project_id, "workspace_id": project.workspace_id, "user_id": request.user.id},
+             partial=True,
+         )
+         if serializer.is_valid():
+diff --git a/apps/api/plane/app/serializers/draft.py b/apps/api/plane/app/serializers/draft.py
+index da6eae6e2..70255a51a 100644
+--- a/apps/api/plane/app/serializers/draft.py
++++ b/apps/api/plane/app/serializers/draft.py
+@@ -28,6 +28,7 @@ from plane.utils.content_validator import (
+     validate_binary_data,
+ )
+ from plane.app.permissions import ROLE
++from plane.utils.issue_parent import validate_parent_issue
+ 
+ 
+ class DraftIssueCreateSerializer(BaseSerializer):
+@@ -118,15 +119,13 @@ class DraftIssueCreateSerializer(BaseSerializer):
+         ):
+             raise serializers.ValidationError("State is not valid please pass a valid state_id")
+ 
+-        # # Check parent issue is from workspace as it can be cross workspace
+-        if (
+-            attrs.get("parent")
+-            and not Issue.objects.filter(
+-                project_id=self.context.get("project_id"),
+-                pk=attrs.get("parent").id,
+-            ).exists()
+-        ):
+-            raise serializers.ValidationError("Parent is not valid issue_id please pass a valid issue_id")
++        # Parent may live in another project of the same workspace
++        if attrs.get("parent"):
++            validate_parent_issue(
++                attrs.get("parent"),
++                self.context.get("project_id"),
++                user_id=self.context.get("user_id"),
++            )
+ 
+         if (
+             attrs.get("estimate_point")
+diff --git a/apps/api/plane/app/serializers/issue.py b/apps/api/plane/app/serializers/issue.py
+index 2e116cd66..da6d17860 100644
+--- a/apps/api/plane/app/serializers/issue.py
++++ b/apps/api/plane/app/serializers/issue.py
+@@ -47,6 +47,7 @@ from plane.utils.content_validator import (
+     validate_html_content,
+     validate_binary_data,
+ )
++from plane.utils.issue_parent import validate_parent_issue
+ 
+ 
+ class IssueFlatSerializer(BaseSerializer):
+@@ -175,15 +176,14 @@ class IssueCreateSerializer(BaseSerializer):
+         ):
+             raise serializers.ValidationError("State is not valid please pass a valid state_id")
+ 
+-        # Check parent issue is from workspace as it can be cross workspace
+-        if (
+-            attrs.get("parent")
+-            and not Issue.objects.filter(
+-                project_id=self.context.get("project_id"),
+-                pk=attrs.get("parent").id,
+-            ).exists()
+-        ):
+-            raise serializers.ValidationError("Parent is not valid issue_id please pass a valid issue_id")
++        # Parent may live in another project of the same workspace
++        if attrs.get("parent"):
++            validate_parent_issue(
++                attrs.get("parent"),
++                self.context.get("project_id"),
++                user_id=self.context.get("user_id"),
++                instance=self.instance,
++            )
+ 
+         if (
+             attrs.get("estimate_point")
+diff --git a/apps/api/plane/app/views/intake/base.py b/apps/api/plane/app/views/intake/base.py
+index e51376e66..a77378f89 100644
+--- a/apps/api/plane/app/views/intake/base.py
++++ b/apps/api/plane/app/views/intake/base.py
+@@ -264,6 +264,7 @@ class IntakeIssueViewSet(BaseViewSet):
+                 "workspace_id": project.workspace_id,
+                 "default_assignee_id": project.default_assignee_id,
+                 "allow_triage_state": True,
++                "user_id": request.user.id,
+             },
+         )
+         if serializer.is_valid():
+@@ -412,7 +413,7 @@ class IntakeIssueViewSet(BaseViewSet):
+             issue_requested_data = json.dumps(issue_data, cls=DjangoJSONEncoder)
+ 
+             issue_serializer = IssueCreateSerializer(
+-                issue, data=issue_data, partial=True, context={"project_id": project_id, "allow_triage_state": True}
++                issue, data=issue_data, partial=True, context={"project_id": project_id, "allow_triage_state": True, "user_id": request.user.id}
+             )
+ 
+             if not issue_serializer.is_valid():
+diff --git a/apps/api/plane/app/views/issue/base.py b/apps/api/plane/app/views/issue/base.py
+index 3b8b05a6a..6ac69471f 100644
+--- a/apps/api/plane/app/views/issue/base.py
++++ b/apps/api/plane/app/views/issue/base.py
+@@ -411,6 +411,7 @@ class IssueViewSet(BaseViewSet):
+                 "project_id": project_id,
+                 "workspace_id": project.workspace_id,
+                 "default_assignee_id": project.default_assignee_id,
++                "user_id": request.user.id,
+             },
+         )
+ 
+@@ -677,7 +678,12 @@ class IssueViewSet(BaseViewSet):
+         current_instance = json.dumps(IssueDetailSerializer(issue).data, cls=DjangoJSONEncoder)
+ 
+         requested_data = json.dumps(self.request.data, cls=DjangoJSONEncoder)
+-        serializer = IssueCreateSerializer(issue, data=request.data, partial=True, context={"project_id": project_id})
++        serializer = IssueCreateSerializer(
++            issue,
++            data=request.data,
++            partial=True,
++            context={"project_id": project_id, "user_id": request.user.id},
++        )
+         if serializer.is_valid():
+             serializer.save()
+             # Check if the update is a migration description update
+diff --git a/apps/api/plane/app/views/issue/sub_issue.py b/apps/api/plane/app/views/issue/sub_issue.py
+index d1d7d8f11..8d04e5b3d 100644
+--- a/apps/api/plane/app/views/issue/sub_issue.py
++++ b/apps/api/plane/app/views/issue/sub_issue.py
+@@ -21,13 +21,14 @@ from rest_framework import status
+ # Module imports
+ from .. import BaseAPIView
+ from plane.app.serializers import IssueSerializer
+-from plane.app.permissions import ProjectEntityPermission
++from plane.app.permissions import ProjectEntityPermission, ROLE
+ from plane.db.models import Issue, IssueLink, FileAsset, CycleIssue, IssueLabel, IssueAssignee, ModuleIssue
+ from plane.bgtasks.issue_activities_task import issue_activity
+ from plane.utils.timezone_converter import user_timezone_converter
+ from collections import defaultdict
+ from plane.utils.host import base_host
+ from plane.utils.order_queryset import order_issue_queryset
++from plane.utils.issue_parent import get_ancestor_ids
+ 
+ 
+ class SubIssuesEndpoint(BaseAPIView):
+@@ -35,8 +36,19 @@ class SubIssuesEndpoint(BaseAPIView):
+ 
+     @method_decorator(gzip_page)
+     def get(self, request, slug, project_id, issue_id):
++        # SECURITY: the parent must live in the URL project (ProjectEntityPermission
++        # only checks membership of `project_id`). Sub work items themselves may
++        # live in other projects of the workspace; only return the ones from
++        # projects the requesting user is an active member of.
+         sub_issues = (
+-            Issue.issue_objects.filter(parent_id=issue_id, workspace__slug=slug)
++            Issue.issue_objects.filter(
++                parent_id=issue_id,
++                parent__project_id=project_id,
++                workspace__slug=slug,
++                project__project_projectmember__member=request.user,
++                project__project_projectmember__is_active=True,
++            )
++            .distinct()
+             .annotate(
+                 cycle_id=Subquery(
+                     CycleIssue.objects.filter(issue=OuterRef("id"), deleted_at__isnull=True).values("cycle_id")[:1]
+@@ -202,7 +214,10 @@ class SubIssuesEndpoint(BaseAPIView):
+ 
+     # Assign multiple sub issues
+     def post(self, request, slug, project_id, issue_id):
+-        parent_issue = Issue.issue_objects.get(pk=issue_id)
++        parent_issue = Issue.issue_objects.filter(pk=issue_id, workspace__slug=slug, project_id=project_id).first()
++        if parent_issue is None:
++            return Response({"error": "Parent work item not found"}, status=status.HTTP_404_NOT_FOUND)
++
+         sub_issue_ids = request.data.get("sub_issue_ids", [])
+ 
+         if not len(sub_issue_ids):
+@@ -211,30 +226,52 @@ class SubIssuesEndpoint(BaseAPIView):
+                 status=status.HTTP_400_BAD_REQUEST,
+             )
+ 
+-        # Scope to workspace to prevent cross-tenant IDOR
+-        sub_issues = Issue.issue_objects.filter(id__in=sub_issue_ids, workspace__slug=slug)
++        # Sub work items may come from any project in the workspace that the
++        # user is an active member of. Exclude the parent itself and its
++        # ancestors so no cycles can be created.
++        excluded_ids = {str(issue_id)} | {str(i) for i in get_ancestor_ids(issue_id)}
++        sub_issues = list(
++            Issue.issue_objects.filter(
++                id__in=sub_issue_ids,
++                workspace__slug=slug,
++                project__project_projectmember__member=request.user,
++                project__project_projectmember__is_active=True,
++                project__project_projectmember__role__gt=ROLE.GUEST.value,
++            )
++            .exclude(id__in=excluded_ids)
++            .distinct()
++        )
++
++        previous_parents = {str(sub_issue.id): sub_issue.parent_id for sub_issue in sub_issues}
+ 
+         for sub_issue in sub_issues:
+             sub_issue.parent = parent_issue
+ 
+         _ = Issue.objects.bulk_update(sub_issues, ["parent"], batch_size=10)
+ 
+-        updated_sub_issues = Issue.issue_objects.filter(id__in=sub_issue_ids).annotate(state_group=F("state__group"))
++        updated_ids = [sub_issue.id for sub_issue in sub_issues]
++        updated_sub_issues = Issue.issue_objects.filter(id__in=updated_ids).annotate(state_group=F("state__group"))
+ 
+-        # Track the issue
++        # Track the issue under each sub work item's own project
+         _ = [
+             issue_activity.delay(
+                 type="issue.activity.updated",
+                 requested_data=json.dumps({"parent": str(issue_id)}),
+                 actor_id=str(request.user.id),
+-                issue_id=str(sub_issue_id),
+-                project_id=str(project_id),
+-                current_instance=json.dumps({"parent": str(sub_issue_id)}),
++                issue_id=str(sub_issue.id),
++                project_id=str(sub_issue.project_id),
++                current_instance=json.dumps(
++                    {
++                        "parent": str(previous_parents[str(sub_issue.id)])
++                        if previous_parents[str(sub_issue.id)]
++                        else None
++                    }
++                ),
+                 epoch=int(timezone.now().timestamp()),
+                 notification=True,
+                 origin=base_host(request=request, is_app=True),
+             )
+-            for sub_issue_id in sub_issue_ids
++            for sub_issue in sub_issues
+         ]
+ 
+         # create's a dict with state group name with their respective issue id's
+diff --git a/apps/api/plane/app/views/search/issue.py b/apps/api/plane/app/views/search/issue.py
+index 737fe6410..728d22e5a 100644
+--- a/apps/api/plane/app/views/search/issue.py
++++ b/apps/api/plane/app/views/search/issue.py
+@@ -13,6 +13,7 @@ from rest_framework.response import Response
+ from .base import BaseAPIView
+ from plane.db.models import Issue, ProjectMember, IssueRelation
+ from plane.utils.issue_search import search_issues
++from plane.utils.issue_parent import get_descendant_ids
+ 
+ 
+ class IssueSearchEndpoint(BaseAPIView):
+@@ -41,7 +42,10 @@ class IssueSearchEndpoint(BaseAPIView):
+ 
+         issue = Issue.issue_objects.filter(pk=issue_id).first()
+         if issue:
+-            issues = issues.filter(~Q(pk=issue_id), ~Q(pk=issue.parent_id), ~Q(parent_id=issue_id))
++            # Exclude self, the current parent and every descendant so that a
++            # work item can never become the parent of one of its ancestors.
++            descendant_ids = get_descendant_ids(issue_id)
++            issues = issues.filter(~Q(pk=issue_id), ~Q(pk=issue.parent_id)).exclude(pk__in=descendant_ids)
+         return issues
+ 
+     def filter_issues_excluding_related_issues(self, issue_id: str, issues: QuerySet) -> QuerySet:
+@@ -71,8 +75,8 @@ class IssueSearchEndpoint(BaseAPIView):
+         issue = Issue.issue_objects.filter(pk=issue_id).first()
+         if issue:
+             issues = issues.filter(~Q(pk=issue_id), parent__isnull=True)
+-        if issue.parent:
+-            issues = issues.filter(~Q(pk=issue.parent_id))
++            if issue.parent_id:
++                issues = issues.filter(~Q(pk=issue.parent_id))
+         return issues
+ 
+     def exclude_issues_in_cycles(self, issues: QuerySet) -> QuerySet:
+diff --git a/apps/api/plane/app/views/workspace/draft.py b/apps/api/plane/app/views/workspace/draft.py
+index aa228ded3..53aa556a8 100644
+--- a/apps/api/plane/app/views/workspace/draft.py
++++ b/apps/api/plane/app/views/workspace/draft.py
+@@ -117,6 +117,7 @@ class WorkspaceDraftIssueViewSet(BaseViewSet):
+             context={
+                 "workspace_id": workspace.id,
+                 "project_id": request.data.get("project_id", None),
++                "user_id": request.user.id,
+             },
+         )
+         if serializer.is_valid():
+@@ -174,6 +175,7 @@ class WorkspaceDraftIssueViewSet(BaseViewSet):
+             context={
+                 "project_id": project_id,
+                 "cycle_id": request.data.get("cycle_id", "not_provided"),
++                "user_id": request.user.id,
+             },
+         )
+ 
+@@ -218,6 +220,7 @@ class WorkspaceDraftIssueViewSet(BaseViewSet):
+                 "project_id": draft_issue.project_id,
+                 "workspace_id": draft_issue.project.workspace_id,
+                 "default_assignee_id": draft_issue.project.default_assignee_id,
++                "user_id": request.user.id,
+             },
+         )
+ 
+diff --git a/apps/api/plane/utils/issue_parent.py b/apps/api/plane/utils/issue_parent.py
+new file mode 100644
+index 000000000..d0453e36c
+--- /dev/null
++++ b/apps/api/plane/utils/issue_parent.py
+@@ -0,0 +1,91 @@
++# Copyright (c) 2023-present Plane Software, Inc. and contributors
++# SPDX-License-Identifier: AGPL-3.0-only
++# See the LICENSE file for details.
++
++"""
++Helpers for validating parent / sub work item relationships.
++
++A parent work item may live in a different project from its child, as long as
++both are in the same workspace and the acting user is a member of the parent's
++project. Cycles (an issue becoming its own ancestor) are rejected.
++"""
++
++# Third party imports
++from rest_framework import serializers
++
++# Module imports
++from plane.db.models import Issue, Project, ProjectMember
++
++# Guest role value (kept local to avoid importing plane.app from plane.utils)
++GUEST_ROLE = 5
++
++MAX_PARENT_DEPTH = 100
++
++
++def get_ancestor_ids(issue_id):
++    """Return the set of ancestor issue ids of ``issue_id`` (excluding itself)."""
++    ancestors = set()
++    current_id = issue_id
++    for _ in range(MAX_PARENT_DEPTH):
++        parent_id = Issue.objects.filter(pk=current_id).values_list("parent_id", flat=True).first()
++        if parent_id is None or parent_id in ancestors:
++            break
++        ancestors.add(parent_id)
++        current_id = parent_id
++    return ancestors
++
++
++def get_descendant_ids(issue_id):
++    """Return the set of all descendant issue ids of ``issue_id`` (excluding itself)."""
++    descendants = set()
++    frontier = [issue_id]
++    for _ in range(MAX_PARENT_DEPTH):
++        if not frontier:
++            break
++        children = list(Issue.objects.filter(parent_id__in=frontier).values_list("id", flat=True))
++        children = [c for c in children if c not in descendants]
++        descendants.update(children)
++        frontier = children
++    return descendants
++
++
++def validate_parent_issue(parent, project_id, user_id=None, instance=None):
++    """
++    Validate that ``parent`` can be the parent of a work item in ``project_id``.
++
++    Rules:
++    - The parent must exist in the same workspace as ``project_id``.
++    - If the parent is in another project, ``user_id`` (when given) must be an
++      active, non-guest member of that project.
++    - A work item cannot be its own parent or the descendant of itself.
++    """
++    if parent is None:
++        return
++
++    project = Project.objects.filter(pk=project_id).values("workspace_id").first()
++    if project is None:
++        raise serializers.ValidationError("Project is not valid")
++
++    parent_row = Issue.objects.filter(pk=parent.id).values("project_id", "workspace_id").first()
++    if parent_row is None or str(parent_row["workspace_id"]) != str(project["workspace_id"]):
++        raise serializers.ValidationError("Parent is not valid issue_id please pass a valid issue_id")
++
++    # Cross-project parent: acting user must be a non-guest member of the parent's project
++    if (
++        user_id is not None
++        and str(parent_row["project_id"]) != str(project_id)
++        and not ProjectMember.objects.filter(
++            project_id=parent_row["project_id"],
++            member_id=user_id,
++            is_active=True,
++            role__gt=GUEST_ROLE,
++        ).exists()
++    ):
++        raise serializers.ValidationError("Parent is not valid issue_id please pass a valid issue_id")
++
++    # Cycle detection (only meaningful when updating an existing work item)
++    if instance is not None:
++        if str(parent.id) == str(instance.id):
++            raise serializers.ValidationError("A work item cannot be its own parent")
++        if str(instance.id) in {str(i) for i in get_ancestor_ids(parent.id)}:
++            raise serializers.ValidationError("Cannot set a sub work item as the parent of its own ancestor")
+diff --git a/apps/web/core/components/issues/issue-detail-widgets/issue-detail-widget-modals.tsx b/apps/web/core/components/issues/issue-detail-widgets/issue-detail-widget-modals.tsx
+index 9071e3eb6..f41557596 100644
+--- a/apps/web/core/components/issues/issue-detail-widgets/issue-detail-widget-modals.tsx
++++ b/apps/web/core/components/issues/issue-detail-widgets/issue-detail-widget-modals.tsx
+@@ -181,6 +181,7 @@ export const IssueDetailWidgetModals = observer(function IssueDetailWidgetModals
+           handleClose={handleExistingIssuesModalClose}
+           searchParams={existingIssuesModalSearchParams}
+           handleOnSubmit={handleExistingIssuesModalOnSubmit}
++          workspaceLevelToggle
+         />
+       )}
+ 
+diff --git a/apps/web/core/components/issues/issue-detail-widgets/sub-issues/issues-list/list-item.tsx b/apps/web/core/components/issues/issue-detail-widgets/sub-issues/issues-list/list-item.tsx
+index e1c70a5fd..bdefbae80 100644
+--- a/apps/web/core/components/issues/issue-detail-widgets/sub-issues/issues-list/list-item.tsx
++++ b/apps/web/core/components/issues/issue-detail-widgets/sub-issues/issues-list/list-item.tsx
+@@ -132,7 +132,7 @@ export const SubIssuesListItem = observer(function SubIssuesListItem(props: Prop
+                         e.stopPropagation();
+                         if (!subIssueHelpers.issue_visibility.includes(issueId)) {
+                           setSubIssueHelpers(parentIssueId, "preview_loader", issueId);
+-                          await fetchSubIssues(workspaceSlug, projectId, issueId);
++                          await fetchSubIssues(workspaceSlug, issue.project_id ?? projectId, issueId);
+                           setSubIssueHelpers(parentIssueId, "preview_loader", issueId);
+                         }
+                         setSubIssueHelpers(parentIssueId, "issue_visibility", issueId);
+diff --git a/apps/web/core/components/issues/issue-detail/parent-select.tsx b/apps/web/core/components/issues/issue-detail/parent-select.tsx
+index 543275c98..72c1095c5 100644
+--- a/apps/web/core/components/issues/issue-detail/parent-select.tsx
++++ b/apps/web/core/components/issues/issue-detail/parent-select.tsx
+@@ -28,7 +28,7 @@ type TIssueParentSelect = {
+   issueId: string;
+   projectId: string;
+   workspaceSlug: string;
+-  handleParentIssue: (_issueId?: string | null) => Promise<void>;
++  handleParentIssue: (_issueId?: string | null, _projectId?: string | null) => Promise<void>;
+   handleRemoveSubIssue: (
+     workspaceSlug: string,
+     projectId: string,
+@@ -73,7 +73,7 @@ export const IssueParentSelect = observer(function IssueParentSelect(props: TIss
+         issueId={issueId}
+         isOpen={isParentIssueModalOpen === issueId}
+         handleClose={() => toggleParentIssueModal(null)}
+-        onChange={(issue: any) => handleParentIssue(issue?.id)}
++        onChange={(issue: any) => handleParentIssue(issue?.id, issue?.project_id)}
+       />
+       <button
+         type="button"
+diff --git a/apps/web/core/components/issues/parent-issues-list-modal.tsx b/apps/web/core/components/issues/parent-issues-list-modal.tsx
+index 093e86617..cb4e367e3 100644
+--- a/apps/web/core/components/issues/parent-issues-list-modal.tsx
++++ b/apps/web/core/components/issues/parent-issues-list-modal.tsx
+@@ -13,10 +13,11 @@ import { Combobox } from "@headlessui/react";
+ // i18n
+ import { useTranslation } from "@plane/i18n";
+ import { SearchIcon } from "@plane/propel/icons";
++import { Tooltip } from "@plane/propel/tooltip";
+ // types
+ import type { ISearchIssueResponse } from "@plane/types";
+ // ui
+-import { Loader, EModalPosition, EModalWidth, ModalCore } from "@plane/ui";
++import { Loader, EModalPosition, EModalWidth, ModalCore, ToggleSwitch } from "@plane/ui";
+ import { generateWorkItemLink, getTabIndex } from "@plane/utils";
+ // components
+ import { IssueSearchModalEmptyState } from "@/components/core/modals/issue-search-modal-empty-state";
+@@ -35,6 +36,8 @@ type Props = {
+   projectId: string | undefined;
+   issueId?: string;
+   searchEpic?: boolean;
++  /** Show a toggle that widens the search to every project in the workspace. Defaults to true. */
++  workspaceLevelToggle?: boolean;
+ };
+ 
+ // services
+@@ -48,6 +51,7 @@ export function ParentIssuesListModal({
+   projectId,
+   issueId,
+   searchEpic = false,
++  workspaceLevelToggle = true,
+ }: Props) {
+   // i18n
+   const { t } = useTranslation();
+@@ -56,6 +60,7 @@ export function ParentIssuesListModal({
+   const [searchTerm, setSearchTerm] = useState("");
+   const [issues, setIssues] = useState<ISearchIssueResponse[]>([]);
+   const [isSearching, setIsSearching] = useState(false);
++  const [isWorkspaceLevel, setIsWorkspaceLevel] = useState(false);
+   const { isMobile } = usePlatformOS();
+   const debouncedSearchTerm: string = useDebounce(searchTerm, 500);
+ 
+@@ -79,7 +84,7 @@ export function ParentIssuesListModal({
+         search: debouncedSearchTerm,
+         parent: searchEpic ? undefined : true,
+         issue_id: issueId,
+-        workspace_search: false,
++        workspace_search: workspaceLevelToggle ? isWorkspaceLevel : false,
+         epic: searchEpic ? true : undefined,
+       })
+       .then((res) => setIssues(res))
+@@ -87,7 +92,7 @@ export function ParentIssuesListModal({
+         setIsSearching(false);
+         setIsLoading(false);
+       });
+-  }, [debouncedSearchTerm, isOpen, issueId, projectId, workspaceSlug]);
++  }, [debouncedSearchTerm, isOpen, issueId, projectId, workspaceSlug, isWorkspaceLevel, workspaceLevelToggle]);
+ 
+   return (
+     <ModalCore isOpen={isOpen} handleClose={handleClose} position={EModalPosition.CENTER} width={EModalWidth.XXL}>
+@@ -112,6 +117,26 @@ export function ParentIssuesListModal({
+             tabIndex={baseTabIndex}
+           />
+         </div>
++        {workspaceLevelToggle && (
++          <div className="flex items-center justify-end px-3 pb-2">
++            <Tooltip tooltipContent={t("common.workspace_level")} isMobile={isMobile}>
++              <div
++                className={`flex flex-shrink-0 cursor-pointer items-center gap-1 text-11 ${
++                  isWorkspaceLevel ? "text-primary" : "text-secondary"
++                }`}
++              >
++                <ToggleSwitch value={isWorkspaceLevel} onChange={() => setIsWorkspaceLevel((prevData) => !prevData)} />
++                <button
++                  type="button"
++                  onClick={() => setIsWorkspaceLevel((prevData) => !prevData)}
++                  className="flex-shrink-0"
++                >
++                  {t("common.workspace_level")}
++                </button>
++              </div>
++            </Tooltip>
++          </div>
++        )}
+         <Combobox.Options static className="vertical-scrollbar scrollbar-md max-h-80 scroll-py-2 overflow-y-auto">
+           {searchTerm !== "" && (
+             <h5 className="mx-2 text-13 text-secondary">
+@@ -121,7 +146,7 @@ export function ParentIssuesListModal({
+                 {searchTerm}
+                 {'"'}
+               </span>{" "}
+-              in project:
++              {isWorkspaceLevel ? "in workspace:" : "in project:"}
+             </h5>
+           )}
+ 
+diff --git a/apps/web/core/components/issues/parent-select-root.tsx b/apps/web/core/components/issues/parent-select-root.tsx
+index d82c770f3..6c8cbc724 100644
+--- a/apps/web/core/components/issues/parent-select-root.tsx
++++ b/apps/web/core/components/issues/parent-select-root.tsx
+@@ -42,11 +42,15 @@ export const IssueParentSelectRoot = observer(function IssueParentSelectRoot(pro
+   const issue = getIssueById(issueId);
+   const parentIssue = issue?.parent_id ? getIssueById(issue.parent_id) : undefined;
+ 
+-  const handleParentIssue = async (_issueId: string | null = null) => {
++  const handleParentIssue = async (_issueId: string | null = null, _parentProjectId: string | null = null) => {
+     try {
+       await issueOperations.update(workspaceSlug, projectId, issueId, { parent_id: _issueId });
+       await issueOperations.fetch(workspaceSlug, projectId, issueId, false);
+-      if (_issueId) await fetchSubIssues(workspaceSlug, projectId, _issueId);
++      if (_issueId) {
++        // the parent may live in another project; fetch its sub work items under its own project
++        const parentProjectId = _parentProjectId ?? getIssueById(_issueId)?.project_id ?? projectId;
++        await fetchSubIssues(workspaceSlug, parentProjectId, _issueId);
++      }
+       toggleParentIssueModal(null);
+     } catch (_error) {
+       console.error("something went wrong while fetching the issue");
+diff --git a/packages/utils/src/work-item/modal.ts b/packages/utils/src/work-item/modal.ts
+index 5b04824fb..bb92a4fdc 100644
+--- a/packages/utils/src/work-item/modal.ts
++++ b/packages/utils/src/work-item/modal.ts
+@@ -17,6 +17,8 @@ export const getUpdateFormDataForReset = (projectId: string | null | undefined,
+   priority: formData.priority,
+   start_date: formData.start_date,
+   target_date: formData.target_date,
++  // parent work items can live in another project of the workspace, so keep the selection
++  parent_id: formData.parent_id,
+ });
+ 
+ export const convertWorkItemDataToSearchResponse = (
+-- 
+2.43.0
+
+
+From 5c8b6b3af1847356d419d429743a6f9125f773a0 Mon Sep 17 00:00:00 2001
+From: Kartheek Nagasuri <kartheek@artiumacademy.com>
+Date: Tue, 3 Nov 2026 06:17:16 +0000
+Subject: [PATCH 2/7] =?UTF-8?q?feat:=20nested=20pages=20=E2=80=94=20sub-pa?=
+ =?UTF-8?q?ges,=20tree=20view,=20move=20to=20page,=20breadcrumbs?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Backend
+- Page list returns every page with `parent` and a visibility-aware
+  `sub_pages_count`; `?parent=<id>` and `?root_only=true` filters.
+- Parent validation on create and update: same project, not archived,
+  not itself, not one of its own descendants.
+- Sub-pages inherit the parent's access on create unless specified.
+- New endpoints: pages/<id>/sub-pages/ and pages/<id>/parents/ (ancestor
+  chain for breadcrumbs), both honouring the guest restriction.
+- Summary counts include nested pages.
+
+Frontend
+- TPageExtended / ExtendedBasePage carry parent, sub_pages_count and
+  sort_order; updateParent() with optimistic update and rollback.
+- Store: root/children/ancestor/descendant selectors; create and delete
+  keep parent counts in sync; archive/restore sync the loaded subtree.
+- Pages list renders a collapsible tree (auto-expanded while searching).
+- Page actions gain "Add sub-page" and "Move to page" (picker excludes
+  the page and its descendants).
+- Page header shows ancestor breadcrumbs.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01CiiWKDVmCA9t6snJ82jWR1
+---
+ apps/api/plane/app/serializers/page.py        |   3 +
+ apps/api/plane/app/urls/page.py               |  11 ++
+ apps/api/plane/app/views/page/base.py         | 156 +++++++++++++++++-
+ .../[projectId]/pages/(detail)/header.tsx     |  21 ++-
+ .../components/pages/dropdowns/actions.tsx    |  58 ++++++-
+ .../pages/editor/toolbar/options-dropdown.tsx |   2 +
+ .../pages/list/block-item-action.tsx          |   2 +
+ apps/web/core/components/pages/list/block.tsx |  42 ++++-
+ apps/web/core/components/pages/list/root.tsx  |  83 +++++++++-
+ .../modals/move-page-to-parent-modal.tsx      | 150 +++++++++++++++++
+ .../services/page/project-page.service.ts     |  18 +-
+ apps/web/core/store/pages/base-page.ts        |  28 +++-
+ .../core/store/pages/extended-base-page.ts    |  64 ++++++-
+ .../core/store/pages/project-page.store.ts    |  74 +++++++++
+ packages/types/src/page/extended.ts           |  19 ++-
+ 15 files changed, 701 insertions(+), 30 deletions(-)
+ create mode 100644 apps/web/core/components/pages/modals/move-page-to-parent-modal.tsx
+
+diff --git a/apps/api/plane/app/serializers/page.py b/apps/api/plane/app/serializers/page.py
+index a9251129c..3d99036bc 100644
+--- a/apps/api/plane/app/serializers/page.py
++++ b/apps/api/plane/app/serializers/page.py
+@@ -24,6 +24,7 @@ from plane.db.models import (
+ 
+ class PageSerializer(BaseSerializer):
+     is_favorite = serializers.BooleanField(read_only=True)
++    sub_pages_count = serializers.IntegerField(read_only=True, required=False)
+     labels = serializers.ListField(
+         child=serializers.PrimaryKeyRelatedField(queryset=Label.objects.all()),
+         write_only=True,
+@@ -55,6 +56,8 @@ class PageSerializer(BaseSerializer):
+             "logo_props",
+             "label_ids",
+             "project_ids",
++            "sub_pages_count",
++            "sort_order",
+         ]
+         read_only_fields = ["workspace", "owned_by"]
+ 
+diff --git a/apps/api/plane/app/urls/page.py b/apps/api/plane/app/urls/page.py
+index dd4395c18..cc4cff570 100644
+--- a/apps/api/plane/app/urls/page.py
++++ b/apps/api/plane/app/urls/page.py
+@@ -29,6 +29,17 @@ urlpatterns = [
+         PageViewSet.as_view({"get": "retrieve", "patch": "partial_update", "delete": "destroy"}),
+         name="project-pages",
+     ),
++    # page hierarchy
++    path(
++        "workspaces/<str:slug>/projects/<uuid:project_id>/pages/<uuid:page_id>/sub-pages/",
++        PageViewSet.as_view({"get": "sub_pages"}),
++        name="project-page-sub-pages",
++    ),
++    path(
++        "workspaces/<str:slug>/projects/<uuid:project_id>/pages/<uuid:page_id>/parents/",
++        PageViewSet.as_view({"get": "parents"}),
++        name="project-page-parents",
++    ),
+     # favorite pages
+     path(
+         "workspaces/<str:slug>/projects/<uuid:project_id>/favorite-pages/<uuid:page_id>/",
+diff --git a/apps/api/plane/app/views/page/base.py b/apps/api/plane/app/views/page/base.py
+index ec391afc1..f69ff954d 100644
+--- a/apps/api/plane/app/views/page/base.py
++++ b/apps/api/plane/app/views/page/base.py
+@@ -19,6 +19,7 @@ from django.db.models import (
+     Case,
+     When,
+     IntegerField,
++    Subquery,
+ )
+ from django.http import StreamingHttpResponse
+ from django.contrib.postgres.aggregates import ArrayAgg
+@@ -72,6 +73,70 @@ def unarchive_archive_page_and_descendants(page_id, archived_at):
+         cursor.execute(sql, [page_id, archived_at])
+ 
+ 
++def get_page_descendant_ids(page_id):
++    """Return ids of every page below ``page_id`` (excluding itself), including soft-deleted rows."""
++    sql = """
++    WITH RECURSIVE descendants AS (
++        SELECT id, 0 AS depth FROM pages WHERE id = %s
++        UNION ALL
++        SELECT pages.id, descendants.depth + 1
++        FROM pages, descendants
++        WHERE pages.parent_id = descendants.id AND descendants.depth < 100
++    )
++    SELECT id FROM descendants WHERE id != %s;
++    """
++    with connection.cursor() as cursor:
++        cursor.execute(sql, [page_id, page_id])
++        return [str(row[0]) for row in cursor.fetchall()]
++
++
++def get_page_ancestors(page_id):
++    """Return the ancestor chain of ``page_id`` from the root down to the direct parent."""
++    sql = """
++    WITH RECURSIVE ancestors AS (
++        SELECT id, parent_id, name, logo_props, access, archived_at, 0 AS depth
++        FROM pages WHERE id = %s AND deleted_at IS NULL
++        UNION ALL
++        SELECT pages.id, pages.parent_id, pages.name, pages.logo_props, pages.access, pages.archived_at, ancestors.depth + 1
++        FROM pages, ancestors
++        WHERE pages.id = ancestors.parent_id AND pages.deleted_at IS NULL AND ancestors.depth < 100
++    )
++    SELECT id, name, logo_props, access, archived_at FROM ancestors WHERE depth > 0 ORDER BY depth DESC;
++    """
++    with connection.cursor() as cursor:
++        cursor.execute(sql, [page_id])
++        rows = cursor.fetchall()
++    return [
++        {"id": str(r[0]), "name": r[1], "logo_props": r[2] if isinstance(r[2], dict) else json.loads(r[2] or "{}"),
++         "access": r[3], "archived_at": r[4]}
++        for r in rows
++    ]
++
++
++def validate_page_parent(parent_id, slug, project_id, page=None):
++    """
++    Validate that ``parent_id`` can be the parent of ``page`` (None when creating).
++    Returns (parent, error_message). Rules: same project, not archived, not self,
++    not one of the page's own descendants.
++    """
++    parent = Page.objects.filter(
++        pk=parent_id,
++        workspace__slug=slug,
++        projects__id=project_id,
++        project_pages__deleted_at__isnull=True,
++    ).first()
++    if parent is None:
++        return None, "Parent page not found in this project"
++    if parent.archived_at is not None:
++        return None, "Cannot nest a page under an archived page"
++    if page is not None:
++        if str(parent.id) == str(page.id):
++            return None, "A page cannot be its own parent"
++        if str(parent.id) in get_page_descendant_ids(page.id):
++            return None, "Cannot move a page under one of its own sub-pages"
++    return parent, None
++
++
+ class PageViewSet(BaseViewSet):
+     serializer_class = PageSerializer
+     model = Page
+@@ -94,7 +159,6 @@ class PageViewSet(BaseViewSet):
+                 projects__project_projectmember__is_active=True,
+                 projects__archived_at__isnull=True,
+             )
+-            .filter(parent__isnull=True)
+             .filter(Q(owned_by=self.request.user) | Q(access=0))
+             .prefetch_related("projects")
+             .select_related("workspace")
+@@ -122,13 +186,36 @@ class PageViewSet(BaseViewSet):
+                     Value([], output_field=ArrayField(UUIDField())),
+                 ),
+             )
++            .annotate(
++                sub_pages_count=Coalesce(
++                    Subquery(
++                        Page.objects.filter(parent_id=OuterRef("id"), archived_at__isnull=True)
++                        .filter(Q(owned_by=self.request.user) | Q(access=Page.PUBLIC_ACCESS))
++                        .order_by()
++                        .values("parent_id")
++                        .annotate(count=Count("id"))
++                        .values("count"),
++                        output_field=IntegerField(),
++                    ),
++                    0,
++                )
++            )
+             .filter(project=True)
+             .distinct()
+         )
+ 
+     def create(self, request, slug, project_id):
++        data = request.data.copy() if hasattr(request.data, "copy") else dict(request.data)
++        parent_id = data.get("parent", None)
++        if parent_id:
++            parent, error = validate_page_parent(parent_id, slug, project_id)
++            if error:
++                return Response({"error": error}, status=status.HTTP_400_BAD_REQUEST)
++            # a sub-page inherits its parent's visibility unless explicitly set
++            if "access" not in data:
++                data["access"] = parent.access
+         serializer = PageSerializer(
+-            data=request.data,
++            data=data,
+             context={
+                 "project_id": project_id,
+                 "owned_by_id": request.user.id,
+@@ -165,12 +252,9 @@ class PageViewSet(BaseViewSet):
+ 
+             parent = request.data.get("parent", None)
+             if parent:
+-                _ = Page.objects.get(
+-                    pk=parent,
+-                    workspace__slug=slug,
+-                    projects__id=project_id,
+-                    project_pages__deleted_at__isnull=True,
+-                )
++                _, error = validate_page_parent(parent, slug, project_id, page=page)
++                if error:
++                    return Response({"error": error}, status=status.HTTP_400_BAD_REQUEST)
+ 
+             # Only update access if the page owner is the requesting  user
+             if page.access != request.data.get("access", page.access) and page.owned_by_id != request.user.id:
+@@ -290,6 +374,12 @@ class PageViewSet(BaseViewSet):
+ 
+     def list(self, request, slug, project_id):
+         queryset = self.get_queryset()
++        # Hierarchy filters. Default returns every page (with its parent id) so clients can build the tree.
++        parent_param = request.query_params.get("parent", None)
++        if parent_param:
++            queryset = queryset.filter(parent_id=parent_param)
++        elif request.query_params.get("root_only", "false").lower() == "true":
++            queryset = queryset.filter(parent__isnull=True)
+         project = Project.objects.get(pk=project_id)
+         if (
+             ProjectMember.objects.filter(
+@@ -426,7 +516,6 @@ class PageViewSet(BaseViewSet):
+                 projects__project_projectmember__is_active=True,
+                 projects__archived_at__isnull=True,
+             )
+-            .filter(parent__isnull=True)
+             .filter(Q(owned_by=request.user) | Q(access=0))
+             .annotate(
+                 project=Exists(
+@@ -468,6 +557,55 @@ class PageViewSet(BaseViewSet):
+ 
+         return Response(stats, status=status.HTTP_200_OK)
+ 
++    def sub_pages(self, request, slug, project_id, page_id):
++        """Direct children of a page that the requesting user can see."""
++        queryset = self.get_queryset().filter(parent_id=page_id)
++        project = Project.objects.get(pk=project_id)
++        if (
++            ProjectMember.objects.filter(
++                workspace__slug=slug,
++                project_id=project_id,
++                member=request.user,
++                role=ROLE.GUEST.value,
++                is_active=True,
++            ).exists()
++            and not project.guest_view_all_features
++        ):
++            queryset = queryset.filter(owned_by=request.user)
++        return Response(PageSerializer(queryset, many=True).data, status=status.HTTP_200_OK)
++
++    def parents(self, request, slug, project_id, page_id):
++        """Ancestor chain (root first) for breadcrumbs. Only ancestors visible to the user are returned."""
++        queryset = self.get_queryset()
++        project = Project.objects.get(pk=project_id)
++        restricted_guest = (
++            ProjectMember.objects.filter(
++                workspace__slug=slug,
++                project_id=project_id,
++                member=request.user,
++                role=ROLE.GUEST.value,
++                is_active=True,
++            ).exists()
++            and not project.guest_view_all_features
++        )
++        if restricted_guest:
++            queryset = queryset.filter(owned_by=request.user)
++        if not queryset.filter(pk=page_id).exists():
++            return Response({"error": "Page not found"}, status=status.HTTP_404_NOT_FOUND)
++        ancestors = get_page_ancestors(page_id)
++        owned_ids = set(
++            str(i)
++            for i in Page.objects.filter(pk__in=[a["id"] for a in ancestors], owned_by=request.user).values_list(
++                "id", flat=True
++            )
++        )
++        visible = [
++            a
++            for a in ancestors
++            if a["id"] in owned_ids or (not restricted_guest and a["access"] == Page.PUBLIC_ACCESS)
++        ]
++        return Response(visible, status=status.HTTP_200_OK)
++
+ 
+ class PageFavoriteViewSet(BaseViewSet):
+     model = UserFavorite
+diff --git a/apps/web/app/(all)/[workspaceSlug]/(projects)/projects/(detail)/[projectId]/pages/(detail)/header.tsx b/apps/web/app/(all)/[workspaceSlug]/(projects)/projects/(detail)/[projectId]/pages/(detail)/header.tsx
+index f43c36acc..16903c421 100644
+--- a/apps/web/app/(all)/[workspaceSlug]/(projects)/projects/(detail)/[projectId]/pages/(detail)/header.tsx
++++ b/apps/web/app/(all)/[workspaceSlug]/(projects)/projects/(detail)/[projectId]/pages/(detail)/header.tsx
+@@ -35,13 +35,15 @@ export const PageDetailsHeader = observer(function PageDetailsHeader() {
+   const { workspaceSlug, pageId, projectId } = useParams();
+   // store hooks
+   const { loader } = useProject();
+-  const { getPageById, getCurrentProjectPageIds } = usePageStore(storeType);
++  const { getPageById, getCurrentProjectPageIds, getPageAncestorIds } = usePageStore(storeType);
+   const page = usePage({
+     pageId: pageId?.toString() ?? "",
+     storeType,
+   });
+   // derived values
+   const projectPageIds = getCurrentProjectPageIds(projectId?.toString());
++  // nested pages: ancestor chain, root first (only ancestors loaded in the store)
++  const ancestorIds = getPageAncestorIds(pageId?.toString() ?? "");
+ 
+   const switcherOptions = projectPageIds
+     .map((id) => {
+@@ -78,6 +80,23 @@ export const PageDetailsHeader = observer(function PageDetailsHeader() {
+               }
+             />
+ 
++            {ancestorIds.map((ancestorId) => {
++              const ancestor = getPageById(ancestorId);
++              if (!ancestor) return null;
++              return (
++                <Breadcrumbs.Item
++                  key={ancestorId}
++                  component={
++                    <BreadcrumbLink
++                      label={getPageName(ancestor.name)}
++                      href={`/${workspaceSlug}/projects/${projectId}/pages/${ancestorId}`}
++                      icon={<SwitcherIcon logo_props={ancestor.logo_props} LabelIcon={PageIcon} size={16} />}
++                    />
++                  }
++                />
++              );
++            })}
++
+             <Breadcrumbs.Item
+               component={
+                 <BreadcrumbNavigationSearchDropdown
+diff --git a/apps/web/core/components/pages/dropdowns/actions.tsx b/apps/web/core/components/pages/dropdowns/actions.tsx
+index 7d63dd62c..959a61b1e 100644
+--- a/apps/web/core/components/pages/dropdowns/actions.tsx
++++ b/apps/web/core/components/pages/dropdowns/actions.tsx
+@@ -7,9 +7,10 @@
+ import { useMemo, useState } from "react";
+ import { observer } from "mobx-react";
+ import { useParams } from "next/navigation";
+-import { ArchiveRestoreIcon, FileOutput, LockKeyhole, LockKeyholeOpen } from "lucide-react";
++import { ArchiveRestoreIcon, FileOutput, FilePlus2, FolderInput, LockKeyhole, LockKeyholeOpen } from "lucide-react";
+ // constants
+ import { EPageAccess } from "@plane/constants";
++import { TOAST_TYPE, setToast } from "@plane/propel/toast";
+ // plane editor
+ import { LinkIcon, CopyIcon, LockIcon, NewTabIcon, ArchiveIcon, TrashIcon, GlobeIcon } from "@plane/propel/icons";
+ // plane ui
+@@ -18,10 +19,13 @@ import { ContextMenu, CustomMenu } from "@plane/ui";
+ // components
+ import { cn } from "@plane/utils";
+ import { DeletePageModal } from "@/components/pages/modals/delete-page-modal";
++import { MovePageToParentModal } from "@/components/pages/modals/move-page-to-parent-modal";
++import { useAppRouter } from "@/hooks/use-app-router";
+ // hooks
+ import { usePageOperations } from "@/hooks/use-page-operations";
+ // plane web hooks
+ import type { EPageStoreType } from "@/hooks/store";
++import { usePageStore } from "@/hooks/store";
+ import { usePageFlag } from "@/hooks/use-page-flag";
+ // store types
+ import type { TPageInstance } from "@/store/pages/base-page";
+@@ -39,7 +43,9 @@ export type TPageActions =
+   | "delete"
+   | "version-history"
+   | "export"
+-  | "move";
++  | "move"
++  | "add-sub-page"
++  | "move-to-page";
+ 
+ type Props = {
+   extraOptions?: (TContextMenuItem & { key: TPageActions })[];
+@@ -54,8 +60,12 @@ export const PageActions = observer(function PageActions(props: Props) {
+   // states
+   const [deletePageModal, setDeletePageModal] = useState(false);
+   const [movePageModal, setMovePageModal] = useState(false);
++  const [moveToParentModal, setMoveToParentModal] = useState(false);
+   // params
+-  const { workspaceSlug } = useParams();
++  const { workspaceSlug, projectId } = useParams();
++  const router = useAppRouter();
++  // store hooks
++  const { createPage, canCurrentUserCreatePage } = usePageStore(storeType);
+   // page flag
+   const { isMovePageEnabled } = usePageFlag({
+     workspaceSlug: workspaceSlug?.toString() ?? "",
+@@ -146,6 +156,35 @@ export const PageActions = observer(function PageActions(props: Props) {
+           icon: FileOutput,
+           shouldRender: canCurrentUserMovePage && isMovePageEnabled,
+         },
++        {
++          key: "add-sub-page",
++          action: async () => {
++            if (!page.id) return;
++            try {
++              const created = await createPage({ parent: page.id, access });
++              const targetProjectId = projectId?.toString() ?? page.project_ids?.[0];
++              if (created?.id && workspaceSlug && targetProjectId)
++                router.push(`/${workspaceSlug}/projects/${targetProjectId}/pages/${created.id}`);
++            } catch (error) {
++              setToast({
++                type: TOAST_TYPE.ERROR,
++                title: "Error!",
++                message:
++                  (error as { error?: string } | undefined)?.error || "Sub-page could not be created. Please try again.",
++              });
++            }
++          },
++          title: "Add sub-page",
++          icon: FilePlus2,
++          shouldRender: canCurrentUserCreatePage && !archived_at,
++        },
++        {
++          key: "move-to-page",
++          action: () => setMoveToParentModal(true),
++          title: "Move to page",
++          icon: FolderInput,
++          shouldRender: canCurrentUserArchivePage && !archived_at && !is_locked,
++        },
+       ];
+       if (extraOptions) {
+         menuItems.push(...extraOptions);
+@@ -165,6 +204,13 @@ export const PageActions = observer(function PageActions(props: Props) {
+       canCurrentUserMovePage,
+       isMovePageEnabled,
+       pageOperations,
++      canCurrentUserCreatePage,
++      createPage,
++      page.id,
++      page.project_ids,
++      projectId,
++      workspaceSlug,
++      router,
+     ]
+   );
+   // arrange options
+@@ -184,6 +230,12 @@ export const PageActions = observer(function PageActions(props: Props) {
+         page={page}
+         storeType={storeType}
+       />
++      <MovePageToParentModal
++        isOpen={moveToParentModal}
++        onClose={() => setMoveToParentModal(false)}
++        page={page}
++        storeType={storeType}
++      />
+       {parentRef && <ContextMenu parentRef={parentRef} items={arrangedOptions} />}
+       <CustomMenu placement="bottom-end" optionsClassName="max-h-[90vh]" ellipsis closeOnSelect>
+         {arrangedOptions.map((item) => {
+diff --git a/apps/web/core/components/pages/editor/toolbar/options-dropdown.tsx b/apps/web/core/components/pages/editor/toolbar/options-dropdown.tsx
+index b0ea592f4..d88f6e1b0 100644
+--- a/apps/web/core/components/pages/editor/toolbar/options-dropdown.tsx
++++ b/apps/web/core/components/pages/editor/toolbar/options-dropdown.tsx
+@@ -139,6 +139,8 @@ export const PageOptionsDropdown = observer(function PageOptionsDropdown(props:
+           "sticky-toolbar",
+           "copy-markdown",
+           "version-history",
++          "add-sub-page",
++          "move-to-page",
+           "make-a-copy",
+           "archive-restore",
+           "delete",
+diff --git a/apps/web/core/components/pages/list/block-item-action.tsx b/apps/web/core/components/pages/list/block-item-action.tsx
+index 2d58545b3..00a9fe08f 100644
+--- a/apps/web/core/components/pages/list/block-item-action.tsx
++++ b/apps/web/core/components/pages/list/block-item-action.tsx
+@@ -77,6 +77,8 @@ export const BlockItemAction = observer(function BlockItemAction(props: Props) {
+       {/* quick actions dropdown */}
+       <PageActions
+         optionsOrder={[
++          "add-sub-page",
++          "move-to-page",
+           "open-in-new-tab",
+           "copy-link",
+           "make-a-copy",
+diff --git a/apps/web/core/components/pages/list/block.tsx b/apps/web/core/components/pages/list/block.tsx
+index 8ceec0d6a..4c9d0c017 100644
+--- a/apps/web/core/components/pages/list/block.tsx
++++ b/apps/web/core/components/pages/list/block.tsx
+@@ -7,9 +7,9 @@
+ import { useRef } from "react";
+ import { observer } from "mobx-react";
+ import { Logo } from "@plane/propel/emoji-icon-picker";
+-import { PageIcon } from "@plane/propel/icons";
++import { ChevronRightIcon, PageIcon } from "@plane/propel/icons";
+ // plane imports
+-import { getPageName } from "@plane/utils";
++import { cn, getPageName } from "@plane/utils";
+ // components
+ import { ListItem } from "@/components/core/list";
+ import { BlockItemAction } from "@/components/pages/list/block-item-action";
+@@ -22,10 +22,17 @@ import { usePage } from "@/hooks/store";
+ type TPageListBlock = {
+   pageId: string;
+   storeType: EPageStoreType;
++  /** nesting level in the pages tree; 0 for top-level pages */
++  depth?: number;
++  hasChildren?: boolean;
++  isExpanded?: boolean;
++  onToggleExpand?: () => void;
+ };
+ 
++const INDENT_PX = 24;
++
+ export const PageListBlock = observer(function PageListBlock(props: TPageListBlock) {
+-  const { pageId, storeType } = props;
++  const { pageId, storeType, depth = 0, hasChildren = false, isExpanded = false, onToggleExpand } = props;
+   // refs
+   const parentRef = useRef(null);
+   // hooks
+@@ -37,20 +44,43 @@ export const PageListBlock = observer(function PageListBlock(props: TPageListBlo
+   // handle page check
+   if (!page) return null;
+   // derived values
+-  const { name, logo_props, getRedirectionLink } = page;
++  const { name, logo_props, getRedirectionLink, sub_pages_count } = page;
++  const childCount = hasChildren ? undefined : sub_pages_count;
+ 
+   return (
+     <ListItem
+       prependTitleElement={
+-        <>
++        <span className="flex items-center gap-1" style={{ paddingLeft: depth * INDENT_PX }}>
++          {hasChildren ? (
++            <button
++              type="button"
++              aria-label={isExpanded ? "Collapse sub-pages" : "Expand sub-pages"}
++              aria-expanded={isExpanded}
++              className="flex size-5 flex-shrink-0 items-center justify-center rounded-sm text-placeholder hover:bg-layer-1 hover:text-tertiary"
++              onClick={(e) => {
++                e.preventDefault();
++                e.stopPropagation();
++                onToggleExpand?.();
++              }}
++            >
++              <ChevronRightIcon className={cn("size-3.5 transition-transform", { "rotate-90": isExpanded })} />
++            </button>
++          ) : (
++            <span className="size-5 flex-shrink-0" />
++          )}
+           {logo_props?.in_use ? (
+             <Logo logo={logo_props} size={16} type="lucide" />
+           ) : (
+             <PageIcon className="h-4 w-4 text-tertiary" />
+           )}
+-        </>
++        </span>
+       }
+       title={getPageName(name)}
++      appendTitleElement={
++        !!childCount && childCount > 0 ? (
++          <span className="ml-2 rounded-sm bg-layer-1 px-1.5 py-0.5 text-10 text-tertiary">{childCount}</span>
++        ) : undefined
++      }
+       itemLink={getRedirectionLink()}
+       actionableItems={<BlockItemAction page={page} parentRef={parentRef} storeType={storeType} />}
+       isMobile={isMobile}
+diff --git a/apps/web/core/components/pages/list/root.tsx b/apps/web/core/components/pages/list/root.tsx
+index 2c42221b0..f85bfb0d2 100644
+--- a/apps/web/core/components/pages/list/root.tsx
++++ b/apps/web/core/components/pages/list/root.tsx
+@@ -4,6 +4,7 @@
+  * See the LICENSE file for details.
+  */
+ 
++import { useCallback, useState } from "react";
+ import { observer } from "mobx-react";
+ // types
+ import type { TPageNavigationTabs } from "@plane/types";
+@@ -20,18 +21,90 @@ type TPagesListRoot = {
+   storeType: EPageStoreType;
+ };
+ 
++type TPageTreeBranchProps = {
++  pageId: string;
++  pageType: TPageNavigationTabs;
++  storeType: EPageStoreType;
++  depth: number;
++  expandedIds: Set<string>;
++  forceExpanded: boolean;
++  onToggle: (pageId: string) => void;
++};
++
++const MAX_RENDER_DEPTH = 20;
++
++/**
++ * Renders a page row followed by its visible sub-pages (nested pages / folders).
++ */
++const PageTreeBranch = observer(function PageTreeBranch(props: TPageTreeBranchProps) {
++  const { pageId, pageType, storeType, depth, expandedIds, forceExpanded, onToggle } = props;
++  const { getChildPageIdsByTab } = usePageStore(storeType);
++  const childIds = getChildPageIdsByTab(pageId, pageType);
++  const hasChildren = childIds.length > 0;
++  const isExpanded = forceExpanded || expandedIds.has(pageId);
++
++  return (
++    <>
++      <PageListBlock
++        pageId={pageId}
++        storeType={storeType}
++        depth={depth}
++        hasChildren={hasChildren}
++        isExpanded={isExpanded}
++        onToggleExpand={() => onToggle(pageId)}
++      />
++      {hasChildren &&
++        isExpanded &&
++        depth < MAX_RENDER_DEPTH &&
++        childIds.map((childId) => (
++          <PageTreeBranch
++            key={childId}
++            pageId={childId}
++            pageType={pageType}
++            storeType={storeType}
++            depth={depth + 1}
++            expandedIds={expandedIds}
++            forceExpanded={forceExpanded}
++            onToggle={onToggle}
++          />
++        ))}
++    </>
++  );
++});
++
+ export const PagesListRoot = observer(function PagesListRoot(props: TPagesListRoot) {
+   const { pageType, storeType } = props;
+   // store hooks
+-  const { getCurrentProjectFilteredPageIdsByTab } = usePageStore(storeType);
++  const { getCurrentProjectRootPageIdsByTab, filters } = usePageStore(storeType);
++  // local state: which folders are open
++  const [expandedIds, setExpandedIds] = useState<Set<string>>(() => new Set());
++  const handleToggle = useCallback((pageId: string) => {
++    setExpandedIds((prev) => {
++      const next = new Set(prev);
++      if (next.has(pageId)) next.delete(pageId);
++      else next.add(pageId);
++      return next;
++    });
++  }, []);
+   // derived values
+-  const filteredPageIds = getCurrentProjectFilteredPageIdsByTab(pageType);
++  const rootPageIds = getCurrentProjectRootPageIdsByTab(pageType);
++  // while searching, show every match in place rather than hiding it under a collapsed parent
++  const forceExpanded = (filters.searchQuery ?? "").trim().length > 0;
+ 
+-  if (!filteredPageIds) return <></>;
++  if (!rootPageIds) return <></>;
+   return (
+     <ListLayout>
+-      {filteredPageIds.map((pageId) => (
+-        <PageListBlock key={pageId} pageId={pageId} storeType={storeType} />
++      {rootPageIds.map((pageId) => (
++        <PageTreeBranch
++          key={pageId}
++          pageId={pageId}
++          pageType={pageType}
++          storeType={storeType}
++          depth={0}
++          expandedIds={expandedIds}
++          forceExpanded={forceExpanded}
++          onToggle={handleToggle}
++        />
+       ))}
+     </ListLayout>
+   );
+diff --git a/apps/web/core/components/pages/modals/move-page-to-parent-modal.tsx b/apps/web/core/components/pages/modals/move-page-to-parent-modal.tsx
+new file mode 100644
+index 000000000..50cf07308
+--- /dev/null
++++ b/apps/web/core/components/pages/modals/move-page-to-parent-modal.tsx
+@@ -0,0 +1,150 @@
++/**
++ * Copyright (c) 2023-present Plane Software, Inc. and contributors
++ * SPDX-License-Identifier: AGPL-3.0-only
++ * See the LICENSE file for details.
++ */
++
++import { useMemo, useState } from "react";
++import { observer } from "mobx-react";
++// headless ui
++import { Combobox } from "@headlessui/react";
++// plane imports
++import { Logo } from "@plane/propel/emoji-icon-picker";
++import { PageIcon, SearchIcon } from "@plane/propel/icons";
++import { TOAST_TYPE, setToast } from "@plane/propel/toast";
++import { EModalPosition, EModalWidth, ModalCore } from "@plane/ui";
++import { cn, getPageName } from "@plane/utils";
++// hooks
++import type { EPageStoreType } from "@/hooks/store";
++import { usePageStore } from "@/hooks/store";
++// store types
++import type { TPageInstance } from "@/store/pages/base-page";
++
++type Props = {
++  isOpen: boolean;
++  onClose: () => void;
++  page: TPageInstance;
++  storeType: EPageStoreType;
++};
++
++const ROOT_OPTION = "__root__";
++
++/**
++ * Pick a new parent page for `page` (nested pages). The page itself, its
++ * descendants and archived pages are excluded so no cycles can be created.
++ */
++export const MovePageToParentModal = observer(function MovePageToParentModal(props: Props) {
++  const { isOpen, onClose, page, storeType } = props;
++  // store hooks
++  const { getCurrentProjectPageIds, getPageById, getPageDescendantIds } = usePageStore(storeType);
++  // states
++  const [query, setQuery] = useState("");
++  const [isSubmitting, setIsSubmitting] = useState(false);
++  // derived values
++  const currentParentId = page.parent ?? null;
++  const candidateIds = useMemo(() => {
++    const projectId = page.project_ids?.[0];
++    if (!projectId || !page.id) return [];
++    const excluded = new Set<string>([page.id, ...getPageDescendantIds(page.id)]);
++    return getCurrentProjectPageIds(projectId).filter((id) => {
++      if (excluded.has(id)) return false;
++      const candidate = getPageById(id);
++      if (!candidate || candidate.archived_at) return false;
++      if (!query.trim()) return true;
++      return getPageName(candidate.name).toLowerCase().includes(query.trim().toLowerCase());
++    });
++  }, [page.id, page.project_ids, query, getCurrentProjectPageIds, getPageById, getPageDescendantIds]);
++
++  const handleClose = () => {
++    setQuery("");
++    onClose();
++  };
++
++  const handleSelect = async (value: string | null) => {
++    if (value === null || isSubmitting) return;
++    const newParentId = value === ROOT_OPTION ? null : value;
++    if (newParentId === currentParentId) {
++      handleClose();
++      return;
++    }
++    setIsSubmitting(true);
++    try {
++      await page.updateParent(newParentId);
++      setToast({
++        type: TOAST_TYPE.SUCCESS,
++        title: "Success!",
++        message: newParentId ? "Page moved under the selected page." : "Page moved to the top level.",
++      });
++      handleClose();
++    } catch (error) {
++      const message =
++        (error as { error?: string } | undefined)?.error || "Page could not be moved. Please try again.";
++      setToast({ type: TOAST_TYPE.ERROR, title: "Error!", message });
++    } finally {
++      setIsSubmitting(false);
++    }
++  };
++
++  return (
++    <ModalCore isOpen={isOpen} handleClose={handleClose} position={EModalPosition.CENTER} width={EModalWidth.XXL}>
++      <Combobox value={currentParentId ?? ROOT_OPTION} onChange={handleSelect}>
++        <div className="relative m-1">
++          <SearchIcon
++            className="text-opacity-40 pointer-events-none absolute top-3.5 left-4 h-5 w-5 text-primary"
++            aria-hidden="true"
++          />
++          <Combobox.Input
++            className="h-12 w-full border-0 bg-transparent pr-4 pl-11 text-primary outline-none placeholder:text-placeholder focus:ring-0 sm:text-13"
++            placeholder="Move under which page?"
++            value={query}
++            onChange={(e) => setQuery(e.target.value)}
++            displayValue={() => ""}
++            autoFocus
++          />
++        </div>
++        <Combobox.Options static className="vertical-scrollbar scrollbar-md max-h-80 scroll-py-2 overflow-y-auto p-2">
++          <Combobox.Option
++            value={ROOT_OPTION}
++            className={({ active, selected }) =>
++              cn(
++                "my-0.5 flex w-full cursor-pointer items-center gap-2 rounded-md px-3 py-2 text-13 text-secondary select-none",
++                { "bg-layer-1 text-primary": active, "text-primary": selected }
++              )
++            }
++          >
++            <PageIcon className="h-4 w-4 text-tertiary" />
++            <span className="truncate">Top level (no parent)</span>
++            {currentParentId === null && <span className="ml-auto text-11 text-placeholder">current</span>}
++          </Combobox.Option>
++          {candidateIds.length === 0 && query.trim() && (
++            <p className="px-3 py-2 text-13 text-placeholder">No matching pages.</p>
++          )}
++          {candidateIds.map((id) => {
++            const candidate = getPageById(id);
++            if (!candidate) return null;
++            return (
++              <Combobox.Option
++                key={id}
++                value={id}
++                className={({ active, selected }) =>
++                  cn(
++                    "my-0.5 flex w-full cursor-pointer items-center gap-2 rounded-md px-3 py-2 text-13 text-secondary select-none",
++                    { "bg-layer-1 text-primary": active, "text-primary": selected }
++                  )
++                }
++              >
++                {candidate.logo_props?.in_use ? (
++                  <Logo logo={candidate.logo_props} size={16} type="lucide" />
++                ) : (
++                  <PageIcon className="h-4 w-4 text-tertiary" />
++                )}
++                <span className="truncate">{getPageName(candidate.name)}</span>
++                {id === currentParentId && <span className="ml-auto text-11 text-placeholder">current</span>}
++              </Combobox.Option>
++            );
++          })}
++        </Combobox.Options>
++      </Combobox>
++    </ModalCore>
++  );
++});
+diff --git a/apps/web/core/services/page/project-page.service.ts b/apps/web/core/services/page/project-page.service.ts
+index 817907e4e..9f002e36f 100644
+--- a/apps/web/core/services/page/project-page.service.ts
++++ b/apps/web/core/services/page/project-page.service.ts
+@@ -6,7 +6,7 @@
+ 
+ // types
+ import { API_BASE_URL } from "@plane/constants";
+-import type { TDocumentPayload, TPage } from "@plane/types";
++import type { TDocumentPayload, TPage, TPageAncestor } from "@plane/types";
+ // helpers
+ // services
+ import { APIService } from "@/services/api.service";
+@@ -29,6 +29,22 @@ export class ProjectPageService extends APIService {
+       });
+   }
+ 
++  async fetchSubPages(workspaceSlug: string, projectId: string, pageId: string): Promise<TPage[]> {
++    return this.get(`/api/workspaces/${workspaceSlug}/projects/${projectId}/pages/${pageId}/sub-pages/`)
++      .then((response) => response?.data)
++      .catch((error) => {
++        throw error?.response?.data;
++      });
++  }
++
++  async fetchParents(workspaceSlug: string, projectId: string, pageId: string): Promise<TPageAncestor[]> {
++    return this.get(`/api/workspaces/${workspaceSlug}/projects/${projectId}/pages/${pageId}/parents/`)
++      .then((response) => response?.data)
++      .catch((error) => {
++        throw error?.response?.data;
++      });
++  }
++
+   async fetchById(workspaceSlug: string, projectId: string, pageId: string, trackVisit: boolean): Promise<TPage> {
+     return this.get(`/api/workspaces/${workspaceSlug}/projects/${projectId}/pages/${pageId}/`, {
+       params: {
+diff --git a/apps/web/core/store/pages/base-page.ts b/apps/web/core/store/pages/base-page.ts
+index 1936a6bd2..d9d9e485b 100644
+--- a/apps/web/core/store/pages/base-page.ts
++++ b/apps/web/core/store/pages/base-page.ts
+@@ -12,11 +12,13 @@ import type { TChangeHandlerProps } from "@plane/propel/emoji-icon-picker";
+ import type { TDocumentPayload, TLogoProps, TNameDescriptionLoader, TPage } from "@plane/types";
+ // plane web store
+ import { ExtendedBasePage } from "@/store/pages/extended-base-page";
++import type { TExtendedPageInstance } from "@/store/pages/extended-base-page";
+ import type { RootStore } from "@/store/root.store";
+ // local imports
+ import { PageEditorInstance } from "./page-editor-info";
+ 
+-export type TBasePage = TPage & {
++export type TBasePage = TPage &
++  TExtendedPageInstance & {
+   // observables
+   isSubmitting: TNameDescriptionLoader;
+   isSyncingWithServer: "syncing" | "synced" | "error";
+@@ -420,6 +422,8 @@ export class BasePage extends ExtendedBasePage implements TBasePage {
+           this.archived_at = response.archived_at;
+         });
+       }
++      // the backend archives the whole subtree; mirror that for nested pages already in the store
++      this.syncDescendantsArchivedAt(this.archived_at ?? new Date().toISOString());
+     } catch (error) {
+       console.error(error);
+       runInAction(() => {
+@@ -428,6 +432,22 @@ export class BasePage extends ExtendedBasePage implements TBasePage {
+     }
+   };
+ 
++  /**
++   * @description apply an archived_at value to every loaded descendant (nested pages)
++   */
++  private syncDescendantsArchivedAt = (archivedAt: string | null) => {
++    if (!this.id) return;
++    const pages = this.rootStore.projectPages;
++    if (!pages?.getPageDescendantIds) return;
++    const descendantIds = pages.getPageDescendantIds(this.id);
++    runInAction(() => {
++      descendantIds.forEach((id) => {
++        const descendant = pages.getPageById(id);
++        if (descendant) descendant.archived_at = archivedAt;
++      });
++    });
++  };
++
+   /**
+    * @description restore the page
+    */
+@@ -442,6 +462,12 @@ export class BasePage extends ExtendedBasePage implements TBasePage {
+       if (shouldSync) {
+         await this.services.restore();
+       }
++      // the backend restores the whole subtree and detaches this page from a still-archived parent
++      this.syncDescendantsArchivedAt(null);
++      runInAction(() => {
++        const parentId = this.parent ?? null;
++        if (parentId && this.rootStore.projectPages?.getPageById(parentId)?.archived_at) this.parent = null;
++      });
+     } catch (error) {
+       console.error(error);
+       runInAction(() => {
+diff --git a/apps/web/core/store/pages/extended-base-page.ts b/apps/web/core/store/pages/extended-base-page.ts
+index 56634456e..9153a196c 100644
+--- a/apps/web/core/store/pages/extended-base-page.ts
++++ b/apps/web/core/store/pages/extended-base-page.ts
+@@ -4,19 +4,77 @@
+  * See the LICENSE file for details.
+  */
+ 
++import { action, makeObservable, observable, runInAction } from "mobx";
+ import type { TPage, TPageExtended } from "@plane/types";
+ import type { CoreRootStore } from "@/store/root.store";
+ import type { TBasePageServices } from "@/store/pages/base-page";
+ 
+ export type TExtendedPageInstance = TPageExtended & {
+   asJSONExtended: TPageExtended;
++  /** Move this page under another page (or to the root with `null`). */
++  updateParent: (parentId: string | null) => Promise<void>;
++  /** Adjust the cached sub-page count without a refetch. */
++  adjustSubPagesCount: (delta: number) => void;
+ };
+ 
++/**
++ * Page hierarchy (nested pages) for the Community Edition.
++ */
+ export class ExtendedBasePage implements TExtendedPageInstance {
+-  // oxlint-disable-next-line no-useless-constructor, no-unused-vars
+-  constructor(store: CoreRootStore, page: TPage, services: TBasePageServices) {}
++  parent: string | null | undefined;
++  sub_pages_count: number;
++  sort_order: number | undefined;
++
++  constructor(
++    private extendedStore: CoreRootStore,
++    page: TPage,
++    private extendedServices: TBasePageServices
++  ) {
++    this.parent = page?.parent ?? null;
++    this.sub_pages_count = page?.sub_pages_count ?? 0;
++    this.sort_order = page?.sort_order;
++
++    makeObservable(this, {
++      parent: observable.ref,
++      sub_pages_count: observable.ref,
++      sort_order: observable.ref,
++      updateParent: action,
++      adjustSubPagesCount: action,
++    });
++  }
+ 
+   get asJSONExtended(): TExtendedPageInstance["asJSONExtended"] {
+-    return {};
++    return {
++      parent: this.parent,
++      sub_pages_count: this.sub_pages_count,
++      sort_order: this.sort_order,
++    };
+   }
++
++  adjustSubPagesCount = (delta: number) => {
++    runInAction(() => {
++      this.sub_pages_count = Math.max(0, (this.sub_pages_count ?? 0) + delta);
++    });
++  };
++
++  updateParent = async (parentId: string | null) => {
++    const previousParent = this.parent ?? null;
++    if (previousParent === parentId) return;
++    const pages = this.extendedStore.projectPages;
++    runInAction(() => {
++      this.parent = parentId;
++      if (previousParent) pages.getPageById(previousParent)?.adjustSubPagesCount(-1);
++      if (parentId) pages.getPageById(parentId)?.adjustSubPagesCount(1);
++    });
++    try {
++      await this.extendedServices.update({ parent: parentId } as Partial<TPage>);
++    } catch (error) {
++      runInAction(() => {
++        this.parent = previousParent;
++        if (previousParent) pages.getPageById(previousParent)?.adjustSubPagesCount(1);
++        if (parentId) pages.getPageById(parentId)?.adjustSubPagesCount(-1);
++      });
++      throw error;
++    }
++  };
+ }
+diff --git a/apps/web/core/store/pages/project-page.store.ts b/apps/web/core/store/pages/project-page.store.ts
+index 4fc70ea7f..0a86a6d99 100644
+--- a/apps/web/core/store/pages/project-page.store.ts
++++ b/apps/web/core/store/pages/project-page.store.ts
+@@ -46,6 +46,11 @@ export interface IProjectPageStore {
+   getCurrentProjectPageIdsByTab: (pageType: TPageNavigationTabs) => string[] | undefined;
+   getCurrentProjectPageIds: (projectId: string) => string[];
+   getCurrentProjectFilteredPageIdsByTab: (pageType: TPageNavigationTabs) => string[] | undefined;
++  // hierarchy helpers
++  getCurrentProjectRootPageIdsByTab: (pageType: TPageNavigationTabs) => string[] | undefined;
++  getChildPageIdsByTab: (parentId: string, pageType: TPageNavigationTabs) => string[];
++  getPageAncestorIds: (pageId: string) => string[];
++  getPageDescendantIds: (pageId: string) => string[];
+   getPageById: (pageId: string) => TProjectPage | undefined;
+   updateFilters: <T extends keyof TPageFilters>(filterKey: T, filterValue: TPageFilters[T]) => void;
+   clearAllFilters: () => void;
+@@ -182,6 +187,68 @@ export class ProjectPageStore implements IProjectPageStore {
+     return pages ?? undefined;
+   });
+ 
++  /**
++   * @description top-level ids for the tree view: visible pages whose parent is not itself visible
++   * (so sub-pages of a hidden/unmatched parent still surface, e.g. while searching)
++   * @param {TPageNavigationTabs} pageType
++   */
++  getCurrentProjectRootPageIdsByTab = computedFn((pageType: TPageNavigationTabs) => {
++    const visibleIds = this.getCurrentProjectFilteredPageIdsByTab(pageType);
++    if (!visibleIds) return undefined;
++    const visible = new Set(visibleIds);
++    return visibleIds.filter((id) => {
++      const parentId = this.data?.[id]?.parent;
++      return !parentId || !visible.has(parentId);
++    });
++  });
++
++  /**
++   * @description visible direct children of a page, honouring the current tab, filters and sort
++   * @param {string} parentId
++   * @param {TPageNavigationTabs} pageType
++   */
++  getChildPageIdsByTab = computedFn((parentId: string, pageType: TPageNavigationTabs) => {
++    const visibleIds = this.getCurrentProjectFilteredPageIdsByTab(pageType) ?? [];
++    return visibleIds.filter((id) => this.data?.[id]?.parent === parentId);
++  });
++
++  /**
++   * @description ancestor ids from the root down to the direct parent (only pages present in the store)
++   * @param {string} pageId
++   */
++  getPageAncestorIds = computedFn((pageId: string) => {
++    const chain: string[] = [];
++    const seen = new Set<string>([pageId]);
++    let current = this.data?.[pageId]?.parent ?? null;
++    while (current && !seen.has(current) && this.data?.[current]) {
++      chain.unshift(current);
++      seen.add(current);
++      current = this.data?.[current]?.parent ?? null;
++    }
++    return chain;
++  });
++
++  /**
++   * @description every page below the given page (only pages present in the store)
++   * @param {string} pageId
++   */
++  getPageDescendantIds = computedFn((pageId: string) => {
++    const result: string[] = [];
++    const queue = [pageId];
++    const seen = new Set<string>([pageId]);
++    while (queue.length) {
++      const current = queue.shift() as string;
++      for (const page of Object.values(this.data ?? {})) {
++        if (page.parent === current && page.id && !seen.has(page.id)) {
++          seen.add(page.id);
++          result.push(page.id);
++          queue.push(page.id);
++        }
++      }
++    }
++    return result;
++  });
++
+   /**
+    * @description get the page store by id
+    * @param {string} pageId
+@@ -307,6 +374,7 @@ export class ProjectPageStore implements IProjectPageStore {
+       const page = await this.service.create(workspaceSlug, projectId, pageData);
+       runInAction(() => {
+         if (page?.id) set(this.data, [page.id], new ProjectPage(this.store, page));
++        if (page?.parent) this.getPageById(page.parent)?.adjustSubPagesCount(1);
+         this.loader = undefined;
+       });
+ 
+@@ -334,6 +402,12 @@ export class ProjectPageStore implements IProjectPageStore {
+ 
+       await this.service.remove(workspaceSlug, projectId, pageId);
+       runInAction(() => {
++        const removed = this.data?.[pageId];
++        // the backend re-roots direct children of a deleted page; mirror that locally
++        Object.values(this.data ?? {}).forEach((page) => {
++          if (page.parent === pageId) page.parent = null;
++        });
++        if (removed?.parent) this.getPageById(removed.parent)?.adjustSubPagesCount(-1);
+         unset(this.data, [pageId]);
+         if (this.rootStore.favorite.entityMap[pageId]) this.rootStore.favorite.removeFavoriteFromStore(pageId);
+       });
+diff --git a/packages/types/src/page/extended.ts b/packages/types/src/page/extended.ts
+index 76f32ce54..0e60183e3 100644
+--- a/packages/types/src/page/extended.ts
++++ b/packages/types/src/page/extended.ts
+@@ -4,4 +4,21 @@
+  * See the LICENSE file for details.
+  */
+ 
+-export type TPageExtended = object;
++/**
++ * Page hierarchy (nested pages). A page with a `parent` is a sub-page; a page
++ * with `sub_pages_count > 0` acts as a folder in the pages list.
++ */
++export type TPageExtended = {
++  parent?: string | null;
++  sub_pages_count?: number;
++  sort_order?: number;
++};
++
++/** Minimal ancestor shape returned by the `parents/` endpoint, used for breadcrumbs. */
++export type TPageAncestor = {
++  id: string;
++  name: string;
++  logo_props: Record<string, unknown>;
++  access: number;
++  archived_at: string | null;
++};
+-- 
+2.43.0
+
+
+From 626c3fb63e46f7d462b56755f58ee6814539c530 Mon Sep 17 00:00:00 2001
+From: Kartheek Nagasuri <kartheek@artiumacademy.com>
+Date: Tue, 3 Nov 2026 06:37:40 +0000
+Subject: [PATCH 3/7] feat(pages): nested page tree under Pages in the project
+ sidebar
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01CiiWKDVmCA9t6snJ82jWR1
+---
+ .../workspace/sidebar/project-navigation.tsx  |  59 ++++++--
+ .../workspace/sidebar/project-pages-tree.tsx  | 136 ++++++++++++++++++
+ 2 files changed, 181 insertions(+), 14 deletions(-)
+ create mode 100644 apps/web/core/components/workspace/sidebar/project-pages-tree.tsx
+
+diff --git a/apps/web/core/components/workspace/sidebar/project-navigation.tsx b/apps/web/core/components/workspace/sidebar/project-navigation.tsx
+index 3582215f3..366cb8e0a 100644
+--- a/apps/web/core/components/workspace/sidebar/project-navigation.tsx
++++ b/apps/web/core/components/workspace/sidebar/project-navigation.tsx
+@@ -4,17 +4,19 @@
+  * See the LICENSE file for details.
+  */
+ 
+-import React, { useCallback, useMemo } from "react";
++import React, { useCallback, useMemo, useState } from "react";
+ import { observer } from "mobx-react";
+ import Link from "next/link";
+ import { useParams, usePathname } from "next/navigation";
+ import { EUserPermissionsLevel, EUserPermissions } from "@plane/constants";
+ import { useTranslation } from "@plane/i18n";
+-import { CycleIcon, IntakeIcon, ModuleIcon, PageIcon, ViewsIcon, WorkItemsIcon } from "@plane/propel/icons";
++import { ChevronRightIcon, CycleIcon, IntakeIcon, ModuleIcon, PageIcon, ViewsIcon, WorkItemsIcon } from "@plane/propel/icons";
++import { cn } from "@plane/utils";
+ import type { EUserProjectRoles } from "@plane/types";
+ // plane ui
+ // components
+ import { SidebarNavItem } from "@/components/sidebar/sidebar-navigation";
++import { ProjectPagesTree } from "@/components/workspace/sidebar/project-pages-tree";
+ // hooks
+ import { useAppTheme } from "@/hooks/store/use-app-theme";
+ import { useIssueDetail } from "@/hooks/store/use-issue-detail";
+@@ -51,6 +53,10 @@ export const ProjectNavigation = observer(function ProjectNavigation(props: TPro
+   } = useIssueDetail();
+   // pathname
+   const pathname = usePathname();
++  // nested pages tree under the "Pages" entry; open by default while browsing pages
++  const isOnPages = pathname.includes(`/projects/${projectId}/pages`);
++  const [isPagesTreeOpen, setIsPagesTreeOpen] = useState<boolean | null>(null);
++  const showPagesTree = isPagesTreeOpen ?? isOnPages;
+   // derived values
+   const workItemId = workItemIdentifierFromRoute
+     ? getIssueIdByIdentifier(workItemIdentifierFromRoute?.toString())
+@@ -182,21 +188,46 @@ export const ProjectNavigation = observer(function ProjectNavigation(props: TPro
+         if (!hasAccess) return null;
+ 
+         const shouldShowCount = item.key === "intake" && (project.intake_count ?? 0) > 0;
++        const isPagesItem = item.key === "pages";
+ 
+         return (
+-          <Link key={item.key} href={item.href} onClick={handleProjectClick}>
+-            <SidebarNavItem isActive={!!isActive(item)}>
+-              <div className="flex w-full items-center justify-between gap-1.5 py-[1px]">
+-                <div className="flex items-center gap-1.5">
+-                  <item.icon
+-                    className={`size-4 flex-shrink-0 ${item.name === "Intake" ? "stroke-1" : "stroke-[1.5]"}`}
+-                  />
+-                  <span className="text-11 font-medium">{t(item.i18n_key)}</span>
++          <React.Fragment key={item.key}>
++            <Link href={item.href} onClick={handleProjectClick}>
++              <SidebarNavItem isActive={!!isActive(item)}>
++                <div className="flex w-full items-center justify-between gap-1.5 py-[1px]">
++                  <div className="flex items-center gap-1.5">
++                    <item.icon
++                      className={`size-4 flex-shrink-0 ${item.name === "Intake" ? "stroke-1" : "stroke-[1.5]"}`}
++                    />
++                    <span className="text-11 font-medium">{t(item.i18n_key)}</span>
++                  </div>
++                  {shouldShowCount && (
++                    <span className="text-11 font-medium text-tertiary">{project.intake_count}</span>
++                  )}
++                  {isPagesItem && (
++                    <button
++                      type="button"
++                      aria-label={showPagesTree ? "Hide pages" : "Show pages"}
++                      aria-expanded={showPagesTree}
++                      className="flex size-4 flex-shrink-0 items-center justify-center rounded-sm text-placeholder opacity-0 hover:bg-layer-1 hover:text-tertiary group-hover:opacity-100"
++                      onClick={(e) => {
++                        e.preventDefault();
++                        e.stopPropagation();
++                        setIsPagesTreeOpen(!showPagesTree);
++                      }}
++                    >
++                      <ChevronRightIcon
++                        className={cn("size-3 transition-transform", { "rotate-90": showPagesTree })}
++                      />
++                    </button>
++                  )}
+                 </div>
+-                {shouldShowCount && <span className="text-11 font-medium text-tertiary">{project.intake_count}</span>}
+-              </div>
+-            </SidebarNavItem>
+-          </Link>
++              </SidebarNavItem>
++            </Link>
++            {isPagesItem && showPagesTree && (
++              <ProjectPagesTree workspaceSlug={workspaceSlug} projectId={projectId} onNavigate={handleProjectClick} />
++            )}
++          </React.Fragment>
+         );
+       })}
+     </>
+diff --git a/apps/web/core/components/workspace/sidebar/project-pages-tree.tsx b/apps/web/core/components/workspace/sidebar/project-pages-tree.tsx
+new file mode 100644
+index 000000000..8178f1548
+--- /dev/null
++++ b/apps/web/core/components/workspace/sidebar/project-pages-tree.tsx
+@@ -0,0 +1,136 @@
++/**
++ * Copyright (c) 2023-present Plane Software, Inc. and contributors
++ * SPDX-License-Identifier: AGPL-3.0-only
++ * See the LICENSE file for details.
++ */
++
++import { useEffect, useState } from "react";
++import { observer } from "mobx-react";
++import Link from "next/link";
++import { useParams } from "next/navigation";
++import useSWR from "swr";
++// plane imports
++import { Logo } from "@plane/propel/emoji-icon-picker";
++import { ChevronRightIcon, PageIcon } from "@plane/propel/icons";
++import { cn, getPageName } from "@plane/utils";
++// components
++import { SidebarNavItem } from "@/components/sidebar/sidebar-navigation";
++// hooks
++import { EPageStoreType, usePageStore } from "@/hooks/store";
++
++type Props = {
++  workspaceSlug: string;
++  projectId: string;
++  onNavigate?: () => void;
++};
++
++const INDENT_PX = 14;
++const MAX_DEPTH = 20;
++
++/**
++ * Nested page tree shown under the "Pages" entry of the project sidebar.
++ * Lists non-archived pages the user can see, nested by parent.
++ */
++export const ProjectPagesTree = observer(function ProjectPagesTree(props: Props) {
++  const { workspaceSlug, projectId, onNavigate } = props;
++  const { pageId: activePageId } = useParams();
++  // store hooks
++  const { getCurrentProjectPageIds, getPageById, getPageAncestorIds, fetchPagesList } = usePageStore(
++    EPageStoreType.PROJECT
++  );
++  // load pages for this project (cached by SWR, shared with the pages list)
++  useSWR(
++    workspaceSlug && projectId ? `PROJECT_PAGES_${projectId}` : null,
++    workspaceSlug && projectId ? () => fetchPagesList(workspaceSlug, projectId) : null,
++    { revalidateOnFocus: false }
++  );
++  // expanded folders
++  const [expandedIds, setExpandedIds] = useState<Set<string>>(() => new Set());
++  // auto-expand the ancestors of the page being viewed
++  const activeId = activePageId?.toString();
++  const activeAncestors = activeId ? getPageAncestorIds(activeId) : [];
++  const activeAncestorsKey = activeAncestors.join("|");
++  useEffect(() => {
++    if (!activeAncestorsKey) return;
++    setExpandedIds((prev) => {
++      const next = new Set(prev);
++      activeAncestorsKey.split("|").forEach((id) => next.add(id));
++      return next;
++    });
++  }, [activeAncestorsKey]);
++
++  // build children map from the store (cheap; recomputed on every observer render so
++  // parent/archive/name changes are reflected immediately)
++  const buildTree = () => {
++    const ids = getCurrentProjectPageIds(projectId);
++    const visible = new Set<string>();
++    const map: Record<string, string[]> = {};
++    const roots: string[] = [];
++    const sorted = ids
++      .map((id) => getPageById(id))
++      .filter((p): p is NonNullable<typeof p> => !!p && !!p.id && !p.archived_at)
++      .sort((a, b) => getPageName(a.name).localeCompare(getPageName(b.name)));
++    sorted.forEach((p) => visible.add(p.id as string));
++    sorted.forEach((p) => {
++      const id = p.id as string;
++      const parent = p.parent ?? null;
++      if (parent && visible.has(parent)) (map[parent] ||= []).push(id);
++      else roots.push(id);
++    });
++    return { childrenOf: map, rootIds: roots };
++  };
++  const { childrenOf, rootIds } = buildTree();
++
++  const toggle = (id: string) =>
++    setExpandedIds((prev) => {
++      const next = new Set(prev);
++      if (next.has(id)) next.delete(id);
++      else next.add(id);
++      return next;
++    });
++
++  const renderNode = (id: string, depth: number): React.ReactNode => {
++    const page = getPageById(id);
++    if (!page) return null;
++    const children = childrenOf[id] ?? [];
++    const hasChildren = children.length > 0;
++    const isExpanded = expandedIds.has(id);
++    const isActive = id === activeId;
++    return (
++      <div key={id}>
++        <Link href={`/${workspaceSlug}/projects/${projectId}/pages/${id}`} onClick={onNavigate}>
++          <SidebarNavItem isActive={isActive} className="py-0.5">
++            <div className="flex w-full items-center gap-1 truncate" style={{ paddingLeft: depth * INDENT_PX }}>
++              {hasChildren ? (
++                <button
++                  type="button"
++                  aria-label={isExpanded ? "Collapse" : "Expand"}
++                  className="flex size-4 flex-shrink-0 items-center justify-center rounded-sm text-placeholder hover:bg-layer-1 hover:text-tertiary"
++                  onClick={(e) => {
++                    e.preventDefault();
++                    e.stopPropagation();
++                    toggle(id);
++                  }}
++                >
++                  <ChevronRightIcon className={cn("size-3 transition-transform", { "rotate-90": isExpanded })} />
++                </button>
++              ) : (
++                <span className="size-4 flex-shrink-0" />
++              )}
++              {page.logo_props?.in_use ? (
++                <Logo logo={page.logo_props} size={12} type="lucide" />
++              ) : (
++                <PageIcon className="size-3.5 flex-shrink-0 text-tertiary" />
++              )}
++              <span className="truncate text-11">{getPageName(page.name)}</span>
++            </div>
++          </SidebarNavItem>
++        </Link>
++        {hasChildren && isExpanded && depth < MAX_DEPTH && children.map((childId) => renderNode(childId, depth + 1))}
++      </div>
++    );
++  };
++
++  if (rootIds.length === 0) return null;
++  return <div className="ml-3 flex flex-col border-l border-subtle pl-1">{rootIds.map((id) => renderNode(id, 0))}</div>;
++});
+-- 
+2.43.0
+
+
+From 224913236ba57080839b41ed5093745d19f09769 Mon Sep 17 00:00:00 2001
+From: Kartheek Nagasuri <kartheek@artiumacademy.com>
+Date: Tue, 3 Nov 2026 09:24:01 +0000
+Subject: [PATCH 4/7] feat(pages): drag-and-drop ordering/nesting, manual sort,
+ sub-pages tab
+
+- "Manual" sort option (sort_order) for the pages list, now the default;
+  new pages are placed after their siblings.
+- Drag a page onto another to nest it, or between rows to reorder it
+  (list), with sort_order persisted and siblings renormalised when tied.
+- Sidebar page tree: drag onto a page to nest, onto "Pages" to move to
+  the top level; ordered the same as the list.
+- Sub-pages tab in the page navigation pane with an "Add sub-page" button.
+- Drag-and-drop gated on create permission; locked pages aren't draggable.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01CiiWKDVmCA9t6snJ82jWR1
+---
+ apps/web/core/components/pages/list/block.tsx | 185 ++++++++++++++----
+ .../core/components/pages/list/order-by.tsx   |   1 +
+ apps/web/core/components/pages/list/root.tsx  |  11 +-
+ .../pages/navigation-pane/tab-panels/index.ts |   7 +-
+ .../pages/navigation-pane/tab-panels/root.tsx |   2 +
+ .../navigation-pane/tab-panels/sub-pages.tsx  | 112 +++++++++++
+ .../workspace/sidebar/project-navigation.tsx  |  33 +++-
+ .../workspace/sidebar/project-pages-tree.tsx  | 109 ++++++++++-
+ .../core/store/pages/extended-base-page.ts    |  36 +++-
+ .../core/store/pages/project-page.store.ts    | 101 +++++++++-
+ packages/i18n/src/locales/en/page.json        |   8 +
+ packages/types/src/page/core.ts               |   2 +-
+ packages/utils/src/page.ts                    |   9 +
+ 13 files changed, 547 insertions(+), 69 deletions(-)
+ create mode 100644 apps/web/core/components/pages/navigation-pane/tab-panels/sub-pages.tsx
+
+diff --git a/apps/web/core/components/pages/list/block.tsx b/apps/web/core/components/pages/list/block.tsx
+index 4c9d0c017..203a7e004 100644
+--- a/apps/web/core/components/pages/list/block.tsx
++++ b/apps/web/core/components/pages/list/block.tsx
+@@ -4,11 +4,17 @@
+  * See the LICENSE file for details.
+  */
+ 
+-import { useRef } from "react";
++import { useEffect, useRef, useState } from "react";
+ import { observer } from "mobx-react";
++import { combine } from "@atlaskit/pragmatic-drag-and-drop/combine";
++import { draggable, dropTargetForElements } from "@atlaskit/pragmatic-drag-and-drop/element/adapter";
++import { attachInstruction, extractInstruction } from "@atlaskit/pragmatic-drag-and-drop-hitbox/tree-item";
+ import { Logo } from "@plane/propel/emoji-icon-picker";
+ import { ChevronRightIcon, PageIcon } from "@plane/propel/icons";
++import { TOAST_TYPE, setToast } from "@plane/propel/toast";
+ // plane imports
++import type { InstructionType } from "@plane/types";
++import { DropIndicator } from "@plane/ui";
+ import { cn, getPageName } from "@plane/utils";
+ // components
+ import { ListItem } from "@/components/core/list";
+@@ -17,7 +23,7 @@ import { BlockItemAction } from "@/components/pages/list/block-item-action";
+ import { usePlatformOS } from "@/hooks/use-platform-os";
+ // plane web hooks
+ import type { EPageStoreType } from "@/hooks/store";
+-import { usePage } from "@/hooks/store";
++import { usePage, usePageStore } from "@/hooks/store";
+ 
+ type TPageListBlock = {
+   pageId: string;
+@@ -27,20 +33,110 @@ type TPageListBlock = {
+   hasChildren?: boolean;
+   isExpanded?: boolean;
+   onToggleExpand?: () => void;
++  /** drag-and-drop is only offered for live (non-archived) pages */
++  isDragEnabled?: boolean;
++  /** last visible sibling in its group; enables dropping after the group */
++  isLastChild?: boolean;
+ };
+ 
++export const PAGE_DND_TYPE = "PAGE";
+ const INDENT_PX = 24;
+ 
++export type TPageDragData = { id: string; type: typeof PAGE_DND_TYPE; parentId: string | null; projectId: string };
++
+ export const PageListBlock = observer(function PageListBlock(props: TPageListBlock) {
+-  const { pageId, storeType, depth = 0, hasChildren = false, isExpanded = false, onToggleExpand } = props;
++  const {
++    pageId,
++    storeType,
++    depth = 0,
++    hasChildren = false,
++    isExpanded = false,
++    onToggleExpand,
++    isDragEnabled = false,
++    isLastChild = false,
++  } = props;
+   // refs
+-  const parentRef = useRef(null);
++  const parentRef = useRef<HTMLDivElement>(null);
++  // states
++  const [isDragging, setIsDragging] = useState(false);
++  const [instruction, setInstruction] = useState<InstructionType | undefined>(undefined);
+   // hooks
+   const page = usePage({
+     pageId,
+     storeType,
+   });
++  const { reorderPage, getPageDescendantIds, canCurrentUserCreatePage } = usePageStore(storeType);
+   const { isMobile } = usePlatformOS();
++
++  // drag and drop (nest by dropping on a row, reorder by dropping between rows)
++  useEffect(() => {
++    const element = parentRef.current;
++    if (!element || !isDragEnabled || !canCurrentUserCreatePage || !page?.id) return;
++    const projectId = page.project_ids?.[0] ?? "";
++    const dragData: TPageDragData = { id: page.id, type: PAGE_DND_TYPE, parentId: page.parent ?? null, projectId };
++    const canDrop = (sourceData: Record<string, unknown>) => {
++      if (sourceData.type !== PAGE_DND_TYPE || sourceData.projectId !== projectId) return false;
++      const sourceId = sourceData.id as string;
++      if (sourceId === page.id) return false;
++      // cannot drop a page inside its own subtree
++      return !getPageDescendantIds(sourceId).includes(page.id as string);
++    };
++    return combine(
++      draggable({
++        element,
++        canDrag: () => !page.is_locked,
++        getInitialData: () => dragData,
++        onDragStart: () => setIsDragging(true),
++        onDrop: () => setIsDragging(false),
++      }),
++      dropTargetForElements({
++        element,
++        canDrop: ({ source }) => canDrop(source.data),
++        getData: ({ input, element: el }) =>
++          attachInstruction(dragData, {
++            input,
++            element: el,
++            currentLevel: depth,
++            indentPerLevel: INDENT_PX,
++            mode: hasChildren && isExpanded ? "expanded" : isLastChild ? "last-in-group" : "standard",
++          }),
++        onDrag: ({ self }) => {
++          const next = extractInstruction(self.data)?.type;
++          setInstruction(next === "instruction-blocked" || next === "reparent" ? undefined : next);
++        },
++        onDragLeave: () => setInstruction(undefined),
++        onDrop: async ({ self, source }) => {
++          setInstruction(undefined);
++          const type = extractInstruction(self.data)?.type;
++          const sourceId = source.data.id as string;
++          if (!type || type === "instruction-blocked" || type === "reparent" || !sourceId) return;
++          try {
++            await reorderPage({ sourceId, targetId: page.id as string, instruction: type });
++          } catch (error) {
++            setToast({
++              type: TOAST_TYPE.ERROR,
++              title: "Error!",
++              message: (error as { error?: string } | undefined)?.error || "Page could not be moved. Please try again.",
++            });
++          }
++        },
++      })
++    );
++  }, [
++    isDragEnabled,
++    canCurrentUserCreatePage,
++    page?.id,
++    page?.parent,
++    page?.is_locked,
++    page?.project_ids,
++    depth,
++    hasChildren,
++    isExpanded,
++    isLastChild,
++    reorderPage,
++    getPageDescendantIds,
++  ]);
++
+   // handle page check
+   if (!page) return null;
+   // derived values
+@@ -48,43 +144,48 @@ export const PageListBlock = observer(function PageListBlock(props: TPageListBlo
+   const childCount = hasChildren ? undefined : sub_pages_count;
+ 
+   return (
+-    <ListItem
+-      prependTitleElement={
+-        <span className="flex items-center gap-1" style={{ paddingLeft: depth * INDENT_PX }}>
+-          {hasChildren ? (
+-            <button
+-              type="button"
+-              aria-label={isExpanded ? "Collapse sub-pages" : "Expand sub-pages"}
+-              aria-expanded={isExpanded}
+-              className="flex size-5 flex-shrink-0 items-center justify-center rounded-sm text-placeholder hover:bg-layer-1 hover:text-tertiary"
+-              onClick={(e) => {
+-                e.preventDefault();
+-                e.stopPropagation();
+-                onToggleExpand?.();
+-              }}
+-            >
+-              <ChevronRightIcon className={cn("size-3.5 transition-transform", { "rotate-90": isExpanded })} />
+-            </button>
+-          ) : (
+-            <span className="size-5 flex-shrink-0" />
+-          )}
+-          {logo_props?.in_use ? (
+-            <Logo logo={logo_props} size={16} type="lucide" />
+-          ) : (
+-            <PageIcon className="h-4 w-4 text-tertiary" />
+-          )}
+-        </span>
+-      }
+-      title={getPageName(name)}
+-      appendTitleElement={
+-        !!childCount && childCount > 0 ? (
+-          <span className="ml-2 rounded-sm bg-layer-1 px-1.5 py-0.5 text-10 text-tertiary">{childCount}</span>
+-        ) : undefined
+-      }
+-      itemLink={getRedirectionLink()}
+-      actionableItems={<BlockItemAction page={page} parentRef={parentRef} storeType={storeType} />}
+-      isMobile={isMobile}
+-      parentRef={parentRef}
+-    />
++    <div className={cn("relative", { "opacity-50": isDragging })}>
++      <DropIndicator isVisible={instruction === "reorder-above"} />
++      <ListItem
++        className={cn({ "bg-layer-transparent-active": instruction === "make-child" })}
++        prependTitleElement={
++          <span className="flex items-center gap-1" style={{ paddingLeft: depth * INDENT_PX }}>
++            {hasChildren ? (
++              <button
++                type="button"
++                aria-label={isExpanded ? "Collapse sub-pages" : "Expand sub-pages"}
++                aria-expanded={isExpanded}
++                className="flex size-5 flex-shrink-0 items-center justify-center rounded-sm text-placeholder hover:bg-layer-1 hover:text-tertiary"
++                onClick={(e) => {
++                  e.preventDefault();
++                  e.stopPropagation();
++                  onToggleExpand?.();
++                }}
++              >
++                <ChevronRightIcon className={cn("size-3.5 transition-transform", { "rotate-90": isExpanded })} />
++              </button>
++            ) : (
++              <span className="size-5 flex-shrink-0" />
++            )}
++            {logo_props?.in_use ? (
++              <Logo logo={logo_props} size={16} type="lucide" />
++            ) : (
++              <PageIcon className="h-4 w-4 text-tertiary" />
++            )}
++          </span>
++        }
++        title={getPageName(name)}
++        appendTitleElement={
++          !!childCount && childCount > 0 ? (
++            <span className="ml-2 rounded-sm bg-layer-1 px-1.5 py-0.5 text-10 text-tertiary">{childCount}</span>
++          ) : undefined
++        }
++        itemLink={getRedirectionLink()}
++        actionableItems={<BlockItemAction page={page} parentRef={parentRef} storeType={storeType} />}
++        isMobile={isMobile}
++        parentRef={parentRef}
++      />
++      <DropIndicator isVisible={instruction === "reorder-below"} />
++    </div>
+   );
+ });
+diff --git a/apps/web/core/components/pages/list/order-by.tsx b/apps/web/core/components/pages/list/order-by.tsx
+index 2e9f22f0a..e0ee47366 100644
+--- a/apps/web/core/components/pages/list/order-by.tsx
++++ b/apps/web/core/components/pages/list/order-by.tsx
+@@ -22,6 +22,7 @@ const PAGE_SORTING_KEY_OPTIONS: {
+   key: TPageFiltersSortKey;
+   label: string;
+ }[] = [
++  { key: "sort_order", label: "Manual" },
+   { key: "name", label: "Name" },
+   { key: "created_at", label: "Date created" },
+   { key: "updated_at", label: "Date modified" },
+diff --git a/apps/web/core/components/pages/list/root.tsx b/apps/web/core/components/pages/list/root.tsx
+index f85bfb0d2..918769bdc 100644
+--- a/apps/web/core/components/pages/list/root.tsx
++++ b/apps/web/core/components/pages/list/root.tsx
+@@ -29,6 +29,7 @@ type TPageTreeBranchProps = {
+   expandedIds: Set<string>;
+   forceExpanded: boolean;
+   onToggle: (pageId: string) => void;
++  isLastChild?: boolean;
+ };
+ 
+ const MAX_RENDER_DEPTH = 20;
+@@ -37,7 +38,7 @@ const MAX_RENDER_DEPTH = 20;
+  * Renders a page row followed by its visible sub-pages (nested pages / folders).
+  */
+ const PageTreeBranch = observer(function PageTreeBranch(props: TPageTreeBranchProps) {
+-  const { pageId, pageType, storeType, depth, expandedIds, forceExpanded, onToggle } = props;
++  const { pageId, pageType, storeType, depth, expandedIds, forceExpanded, onToggle, isLastChild = false } = props;
+   const { getChildPageIdsByTab } = usePageStore(storeType);
+   const childIds = getChildPageIdsByTab(pageId, pageType);
+   const hasChildren = childIds.length > 0;
+@@ -52,11 +53,13 @@ const PageTreeBranch = observer(function PageTreeBranch(props: TPageTreeBranchPr
+         hasChildren={hasChildren}
+         isExpanded={isExpanded}
+         onToggleExpand={() => onToggle(pageId)}
++        isDragEnabled={pageType !== "archived"}
++        isLastChild={isLastChild}
+       />
+       {hasChildren &&
+         isExpanded &&
+         depth < MAX_RENDER_DEPTH &&
+-        childIds.map((childId) => (
++        childIds.map((childId, index) => (
+           <PageTreeBranch
+             key={childId}
+             pageId={childId}
+@@ -66,6 +69,7 @@ const PageTreeBranch = observer(function PageTreeBranch(props: TPageTreeBranchPr
+             expandedIds={expandedIds}
+             forceExpanded={forceExpanded}
+             onToggle={onToggle}
++            isLastChild={index === childIds.length - 1}
+           />
+         ))}
+     </>
+@@ -94,7 +98,7 @@ export const PagesListRoot = observer(function PagesListRoot(props: TPagesListRo
+   if (!rootPageIds) return <></>;
+   return (
+     <ListLayout>
+-      {rootPageIds.map((pageId) => (
++      {rootPageIds.map((pageId, index) => (
+         <PageTreeBranch
+           key={pageId}
+           pageId={pageId}
+@@ -104,6 +108,7 @@ export const PagesListRoot = observer(function PagesListRoot(props: TPagesListRo
+           expandedIds={expandedIds}
+           forceExpanded={forceExpanded}
+           onToggle={handleToggle}
++          isLastChild={index === rootPageIds.length - 1}
+         />
+       ))}
+     </ListLayout>
+diff --git a/apps/web/core/components/pages/navigation-pane/tab-panels/index.ts b/apps/web/core/components/pages/navigation-pane/tab-panels/index.ts
+index 1eb3094a1..4e6e18ed3 100644
+--- a/apps/web/core/components/pages/navigation-pane/tab-panels/index.ts
++++ b/apps/web/core/components/pages/navigation-pane/tab-panels/index.ts
+@@ -4,7 +4,7 @@
+  * See the LICENSE file for details.
+  */
+ 
+-export type TPageNavigationPaneTab = "outline" | "info" | "assets";
++export type TPageNavigationPaneTab = "outline" | "info" | "sub_pages" | "assets";
+ 
+ export const PAGE_NAVIGATION_PANE_TABS_LIST: Record<
+   TPageNavigationPaneTab,
+@@ -21,6 +21,10 @@ export const PAGE_NAVIGATION_PANE_TABS_LIST: Record<
+     key: "info",
+     i18n_label: "page_navigation_pane.tabs.info.label",
+   },
++  sub_pages: {
++    key: "sub_pages",
++    i18n_label: "page_navigation_pane.tabs.sub_pages.label",
++  },
+   assets: {
+     key: "assets",
+     i18n_label: "page_navigation_pane.tabs.assets.label",
+@@ -33,5 +37,6 @@ export const ORDERED_PAGE_NAVIGATION_TABS_LIST: {
+ }[] = [
+   PAGE_NAVIGATION_PANE_TABS_LIST.outline,
+   PAGE_NAVIGATION_PANE_TABS_LIST.info,
++  PAGE_NAVIGATION_PANE_TABS_LIST.sub_pages,
+   PAGE_NAVIGATION_PANE_TABS_LIST.assets,
+ ];
+diff --git a/apps/web/core/components/pages/navigation-pane/tab-panels/root.tsx b/apps/web/core/components/pages/navigation-pane/tab-panels/root.tsx
+index 5cb85bdb6..18d8cbd98 100644
+--- a/apps/web/core/components/pages/navigation-pane/tab-panels/root.tsx
++++ b/apps/web/core/components/pages/navigation-pane/tab-panels/root.tsx
+@@ -12,6 +12,7 @@ import type { TPageInstance } from "@/store/pages/base-page";
+ import { PageNavigationPaneAssetsTabPanel } from "./assets";
+ import { PageNavigationPaneInfoTabPanel } from "./info/root";
+ import { PageNavigationPaneOutlineTabPanel } from "./outline";
++import { PageNavigationPaneSubPagesTabPanel } from "./sub-pages";
+ import { Tabs } from "@plane/propel/tabs";
+ import { ORDERED_PAGE_NAVIGATION_TABS_LIST } from ".";
+ 
+@@ -29,6 +30,7 @@ export function PageNavigationPaneTabPanelsRoot(props: Props) {
+         <Tabs.Content key={tab.key} value={tab.key} className="flex-1 overflow-hidden py-2">
+           {tab.key === "outline" && <PageNavigationPaneOutlineTabPanel page={page} />}
+           {tab.key === "info" && <PageNavigationPaneInfoTabPanel page={page} versionHistory={versionHistory} />}
++          {tab.key === "sub_pages" && <PageNavigationPaneSubPagesTabPanel page={page} />}
+           {tab.key === "assets" && <PageNavigationPaneAssetsTabPanel page={page} />}
+         </Tabs.Content>
+       ))}
+diff --git a/apps/web/core/components/pages/navigation-pane/tab-panels/sub-pages.tsx b/apps/web/core/components/pages/navigation-pane/tab-panels/sub-pages.tsx
+new file mode 100644
+index 000000000..37504223a
+--- /dev/null
++++ b/apps/web/core/components/pages/navigation-pane/tab-panels/sub-pages.tsx
+@@ -0,0 +1,112 @@
++/**
++ * Copyright (c) 2023-present Plane Software, Inc. and contributors
++ * SPDX-License-Identifier: AGPL-3.0-only
++ * See the LICENSE file for details.
++ */
++
++import { useState } from "react";
++import { observer } from "mobx-react";
++import Link from "next/link";
++import { useParams } from "next/navigation";
++import { Plus } from "lucide-react";
++// plane imports
++import { useTranslation } from "@plane/i18n";
++import { Button } from "@plane/propel/button";
++import { Logo } from "@plane/propel/emoji-icon-picker";
++import { PageIcon } from "@plane/propel/icons";
++import { TOAST_TYPE, setToast } from "@plane/propel/toast";
++import { getPageName } from "@plane/utils";
++// hooks
++import { EPageStoreType, usePageStore } from "@/hooks/store";
++import { useAppRouter } from "@/hooks/use-app-router";
++// store
++import type { TPageInstance } from "@/store/pages/base-page";
++
++type Props = {
++  page: TPageInstance;
++};
++
++/**
++ * Lists the direct sub-pages of the current page and lets the user add one.
++ */
++export const PageNavigationPaneSubPagesTabPanel = observer(function PageNavigationPaneSubPagesTabPanel(
++  props: Props
++) {
++  const { page } = props;
++  // navigation
++  const { workspaceSlug, projectId } = useParams();
++  const router = useAppRouter();
++  // translation
++  const { t } = useTranslation();
++  // store
++  const { getManualOrderedChildIds, getPageById, createPage, canCurrentUserCreatePage } = usePageStore(
++    EPageStoreType.PROJECT
++  );
++  // state
++  const [isCreating, setIsCreating] = useState(false);
++  // derived values
++  const resolvedProjectId = projectId?.toString() ?? page.project_ids?.[0] ?? "";
++  const childIds = page.id ? getManualOrderedChildIds(page.id, resolvedProjectId) : [];
++  const canAdd = canCurrentUserCreatePage && !page.archived_at;
++
++  const handleAdd = async () => {
++    if (!page.id || isCreating) return;
++    setIsCreating(true);
++    try {
++      const created = await createPage({ parent: page.id, access: page.access });
++      if (created?.id && workspaceSlug && resolvedProjectId)
++        router.push(`/${workspaceSlug}/projects/${resolvedProjectId}/pages/${created.id}`);
++    } catch (error) {
++      setToast({
++        type: TOAST_TYPE.ERROR,
++        title: "Error!",
++        message: (error as { error?: string } | undefined)?.error || "Sub-page could not be created. Please try again.",
++      });
++    } finally {
++      setIsCreating(false);
++    }
++  };
++
++  return (
++    <div className="flex h-full flex-col gap-3 px-3">
++      {canAdd && (
++        <div>
++          <Button variant="secondary" size="sm" prependIcon={<Plus className="size-3" />} onClick={handleAdd} loading={isCreating}>
++            {t("page_navigation_pane.tabs.sub_pages.add_button")}
++          </Button>
++        </div>
++      )}
++      {childIds.length === 0 ? (
++        <div className="flex flex-col gap-1 py-6 text-center">
++          <p className="text-13 font-medium text-primary">{t("page_navigation_pane.tabs.sub_pages.empty_state.title")}</p>
++          <p className="text-11 text-tertiary">{t("page_navigation_pane.tabs.sub_pages.empty_state.description")}</p>
++        </div>
++      ) : (
++        <ul className="flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto">
++          {childIds.map((id) => {
++            const child = getPageById(id);
++            if (!child) return null;
++            return (
++              <li key={id}>
++                <Link
++                  href={`/${workspaceSlug}/projects/${resolvedProjectId}/pages/${id}`}
++                  className="flex items-center gap-2 rounded-md px-2 py-1.5 text-13 text-secondary hover:bg-layer-transparent-hover hover:text-primary"
++                >
++                  {child.logo_props?.in_use ? (
++                    <Logo logo={child.logo_props} size={14} type="lucide" />
++                  ) : (
++                    <PageIcon className="size-3.5 flex-shrink-0 text-tertiary" />
++                  )}
++                  <span className="truncate">{getPageName(child.name)}</span>
++                  {!!child.sub_pages_count && child.sub_pages_count > 0 && (
++                    <span className="ml-auto text-10 text-placeholder">{child.sub_pages_count}</span>
++                  )}
++                </Link>
++              </li>
++            );
++          })}
++        </ul>
++      )}
++    </div>
++  );
++});
+diff --git a/apps/web/core/components/workspace/sidebar/project-navigation.tsx b/apps/web/core/components/workspace/sidebar/project-navigation.tsx
+index 366cb8e0a..b76548037 100644
+--- a/apps/web/core/components/workspace/sidebar/project-navigation.tsx
++++ b/apps/web/core/components/workspace/sidebar/project-navigation.tsx
+@@ -4,7 +4,8 @@
+  * See the LICENSE file for details.
+  */
+ 
+-import React, { useCallback, useMemo, useState } from "react";
++import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
++import { dropTargetForElements } from "@atlaskit/pragmatic-drag-and-drop/element/adapter";
+ import { observer } from "mobx-react";
+ import Link from "next/link";
+ import { useParams, usePathname } from "next/navigation";
+@@ -16,7 +17,9 @@ import type { EUserProjectRoles } from "@plane/types";
+ // plane ui
+ // components
+ import { SidebarNavItem } from "@/components/sidebar/sidebar-navigation";
++import { PAGE_DND_TYPE } from "@/components/pages/list/block";
+ import { ProjectPagesTree } from "@/components/workspace/sidebar/project-pages-tree";
++import { EPageStoreType, usePageStore } from "@/hooks/store";
+ // hooks
+ import { useAppTheme } from "@/hooks/store/use-app-theme";
+ import { useIssueDetail } from "@/hooks/store/use-issue-detail";
+@@ -63,6 +66,27 @@ export const ProjectNavigation = observer(function ProjectNavigation(props: TPro
+     : undefined;
+   const workItem = workItemId ? getIssueById(workItemId) : undefined;
+   const project = getPartialProjectById(projectId);
++  // dropping a page on the "Pages" entry moves it to the top level
++  const pagesNavRef = useRef<HTMLDivElement>(null);
++  const [isPageDropOver, setIsPageDropOver] = useState(false);
++  const { getPageById } = usePageStore(EPageStoreType.PROJECT);
++  useEffect(() => {
++    const element = pagesNavRef.current;
++    if (!element) return;
++    return dropTargetForElements({
++      element,
++      canDrop: ({ source }) =>
++        source.data.type === PAGE_DND_TYPE &&
++        source.data.projectId === projectId &&
++        !!getPageById(source.data.id as string)?.parent,
++      onDragEnter: () => setIsPageDropOver(true),
++      onDragLeave: () => setIsPageDropOver(false),
++      onDrop: ({ source }) => {
++        setIsPageDropOver(false);
++        getPageById(source.data.id as string)?.updateParent(null);
++      },
++    });
++  }, [getPageById, projectId, project?.page_view]);
+   // handlers
+   const handleProjectClick = () => {
+     if (window.innerWidth < 768) {
+@@ -193,7 +217,11 @@ export const ProjectNavigation = observer(function ProjectNavigation(props: TPro
+         return (
+           <React.Fragment key={item.key}>
+             <Link href={item.href} onClick={handleProjectClick}>
+-              <SidebarNavItem isActive={!!isActive(item)}>
++              <div ref={isPagesItem ? pagesNavRef : undefined}>
++              <SidebarNavItem
++                isActive={!!isActive(item)}
++                className={cn({ "ring-1 ring-accent-strong": isPagesItem && isPageDropOver })}
++              >
+                 <div className="flex w-full items-center justify-between gap-1.5 py-[1px]">
+                   <div className="flex items-center gap-1.5">
+                     <item.icon
+@@ -223,6 +251,7 @@ export const ProjectNavigation = observer(function ProjectNavigation(props: TPro
+                   )}
+                 </div>
+               </SidebarNavItem>
++              </div>
+             </Link>
+             {isPagesItem && showPagesTree && (
+               <ProjectPagesTree workspaceSlug={workspaceSlug} projectId={projectId} onNavigate={handleProjectClick} />
+diff --git a/apps/web/core/components/workspace/sidebar/project-pages-tree.tsx b/apps/web/core/components/workspace/sidebar/project-pages-tree.tsx
+index 8178f1548..a51f84e13 100644
+--- a/apps/web/core/components/workspace/sidebar/project-pages-tree.tsx
++++ b/apps/web/core/components/workspace/sidebar/project-pages-tree.tsx
+@@ -4,19 +4,24 @@
+  * See the LICENSE file for details.
+  */
+ 
+-import { useEffect, useState } from "react";
++import { useEffect, useRef, useState } from "react";
+ import { observer } from "mobx-react";
++import { combine } from "@atlaskit/pragmatic-drag-and-drop/combine";
++import { draggable, dropTargetForElements } from "@atlaskit/pragmatic-drag-and-drop/element/adapter";
+ import Link from "next/link";
+ import { useParams } from "next/navigation";
+ import useSWR from "swr";
+ // plane imports
+ import { Logo } from "@plane/propel/emoji-icon-picker";
+ import { ChevronRightIcon, PageIcon } from "@plane/propel/icons";
+-import { cn, getPageName } from "@plane/utils";
++import { TOAST_TYPE, setToast } from "@plane/propel/toast";
++import { cn, getPageName, orderPages } from "@plane/utils";
+ // components
+ import { SidebarNavItem } from "@/components/sidebar/sidebar-navigation";
+ // hooks
+ import { EPageStoreType, usePageStore } from "@/hooks/store";
++// local imports
++import { PAGE_DND_TYPE } from "@/components/pages/list/block";
+ 
+ type Props = {
+   workspaceSlug: string;
+@@ -35,9 +40,15 @@ export const ProjectPagesTree = observer(function ProjectPagesTree(props: Props)
+   const { workspaceSlug, projectId, onNavigate } = props;
+   const { pageId: activePageId } = useParams();
+   // store hooks
+-  const { getCurrentProjectPageIds, getPageById, getPageAncestorIds, fetchPagesList } = usePageStore(
+-    EPageStoreType.PROJECT
+-  );
++  const {
++    getCurrentProjectPageIds,
++    getPageById,
++    getPageAncestorIds,
++    getPageDescendantIds,
++    fetchPagesList,
++    reorderPage,
++    canCurrentUserCreatePage,
++  } = usePageStore(EPageStoreType.PROJECT);
+   // load pages for this project (cached by SWR, shared with the pages list)
+   useSWR(
+     workspaceSlug && projectId ? `PROJECT_PAGES_${projectId}` : null,
+@@ -66,10 +77,11 @@ export const ProjectPagesTree = observer(function ProjectPagesTree(props: Props)
+     const visible = new Set<string>();
+     const map: Record<string, string[]> = {};
+     const roots: string[] = [];
+-    const sorted = ids
++    const live = ids
+       .map((id) => getPageById(id))
+-      .filter((p): p is NonNullable<typeof p> => !!p && !!p.id && !p.archived_at)
+-      .sort((a, b) => getPageName(a.name).localeCompare(getPageName(b.name)));
++      .filter((p): p is NonNullable<typeof p> => !!p && !!p.id && !p.archived_at);
++    // same manual order as the pages list
++    const sorted = orderPages(live, "sort_order", "asc") as typeof live;
+     sorted.forEach((p) => visible.add(p.id as string));
+     sorted.forEach((p) => {
+       const id = p.id as string;
+@@ -89,6 +101,18 @@ export const ProjectPagesTree = observer(function ProjectPagesTree(props: Props)
+       return next;
+     });
+ 
++  const handleDropOn = async (sourceId: string, targetId: string) => {
++    try {
++      await reorderPage({ sourceId, targetId, instruction: "make-child" });
++    } catch (error) {
++      setToast({
++        type: TOAST_TYPE.ERROR,
++        title: "Error!",
++        message: (error as { error?: string } | undefined)?.error || "Page could not be moved. Please try again.",
++      });
++    }
++  };
++
+   const renderNode = (id: string, depth: number): React.ReactNode => {
+     const page = getPageById(id);
+     if (!page) return null;
+@@ -98,6 +122,14 @@ export const ProjectPagesTree = observer(function ProjectPagesTree(props: Props)
+     const isActive = id === activeId;
+     return (
+       <div key={id}>
++        <SidebarPageRow
++          pageId={id}
++          parentId={page.parent ?? null}
++          projectId={projectId}
++          isDragEnabled={canCurrentUserCreatePage && !page.is_locked}
++          canAccept={(sourceId) => sourceId !== id && !getPageDescendantIds(sourceId).includes(id)}
++          onDropPage={(sourceId) => handleDropOn(sourceId, id)}
++        >
+         <Link href={`/${workspaceSlug}/projects/${projectId}/pages/${id}`} onClick={onNavigate}>
+           <SidebarNavItem isActive={isActive} className="py-0.5">
+             <div className="flex w-full items-center gap-1 truncate" style={{ paddingLeft: depth * INDENT_PX }}>
+@@ -126,6 +158,7 @@ export const ProjectPagesTree = observer(function ProjectPagesTree(props: Props)
+             </div>
+           </SidebarNavItem>
+         </Link>
++        </SidebarPageRow>
+         {hasChildren && isExpanded && depth < MAX_DEPTH && children.map((childId) => renderNode(childId, depth + 1))}
+       </div>
+     );
+@@ -134,3 +167,63 @@ export const ProjectPagesTree = observer(function ProjectPagesTree(props: Props)
+   if (rootIds.length === 0) return null;
+   return <div className="ml-3 flex flex-col border-l border-subtle pl-1">{rootIds.map((id) => renderNode(id, 0))}</div>;
+ });
++
++type TSidebarPageRowProps = {
++  pageId: string;
++  parentId: string | null;
++  projectId: string;
++  isDragEnabled: boolean;
++  canAccept: (sourceId: string) => boolean;
++  onDropPage: (sourceId: string) => void;
++  children: React.ReactNode;
++};
++
++/**
++ * Wraps a sidebar page row so it can be dragged and can accept a page dropped onto it (nesting).
++ */
++function SidebarPageRow(props: TSidebarPageRowProps) {
++  const { pageId, parentId, projectId, isDragEnabled, canAccept, onDropPage, children } = props;
++  const ref = useRef<HTMLDivElement>(null);
++  const [isDragging, setIsDragging] = useState(false);
++  const [isOver, setIsOver] = useState(false);
++  // keep latest callbacks without re-registering the drag handlers on every render
++  const callbacks = useRef({ canAccept, onDropPage });
++  callbacks.current = { canAccept, onDropPage };
++
++  useEffect(() => {
++    const element = ref.current;
++    if (!element) return;
++    return combine(
++      draggable({
++        element,
++        canDrag: () => isDragEnabled,
++        getInitialData: () => ({ id: pageId, type: PAGE_DND_TYPE, parentId, projectId }),
++        onDragStart: () => setIsDragging(true),
++        onDrop: () => setIsDragging(false),
++      }),
++      dropTargetForElements({
++        element,
++        canDrop: ({ source }) =>
++          isDragEnabled &&
++          source.data.type === PAGE_DND_TYPE &&
++          source.data.projectId === projectId &&
++          callbacks.current.canAccept(source.data.id as string),
++        onDragEnter: () => setIsOver(true),
++        onDragLeave: () => setIsOver(false),
++        onDrop: ({ source }) => {
++          setIsOver(false);
++          callbacks.current.onDropPage(source.data.id as string);
++        },
++      })
++    );
++  }, [pageId, parentId, projectId, isDragEnabled]);
++
++  return (
++    <div
++      ref={ref}
++      className={cn("rounded-md", { "opacity-50": isDragging, "ring-1 ring-accent-strong": isOver })}
++    >
++      {children}
++    </div>
++  );
++}
+diff --git a/apps/web/core/store/pages/extended-base-page.ts b/apps/web/core/store/pages/extended-base-page.ts
+index 9153a196c..8bcf90129 100644
+--- a/apps/web/core/store/pages/extended-base-page.ts
++++ b/apps/web/core/store/pages/extended-base-page.ts
+@@ -13,6 +13,8 @@ export type TExtendedPageInstance = TPageExtended & {
+   asJSONExtended: TPageExtended;
+   /** Move this page under another page (or to the root with `null`). */
+   updateParent: (parentId: string | null) => Promise<void>;
++  /** Update parent and/or manual position in one request, with optimistic rollback. */
++  updateHierarchy: (data: { parent?: string | null; sort_order?: number }) => Promise<void>;
+   /** Adjust the cached sub-page count without a refetch. */
+   adjustSubPagesCount: (delta: number) => void;
+ };
+@@ -39,6 +41,7 @@ export class ExtendedBasePage implements TExtendedPageInstance {
+       sub_pages_count: observable.ref,
+       sort_order: observable.ref,
+       updateParent: action,
++      updateHierarchy: action,
+       adjustSubPagesCount: action,
+     });
+   }
+@@ -57,22 +60,37 @@ export class ExtendedBasePage implements TExtendedPageInstance {
+     });
+   };
+ 
+-  updateParent = async (parentId: string | null) => {
++  updateParent = async (parentId: string | null) => this.updateHierarchy({ parent: parentId });
++
++  updateHierarchy = async (data: { parent?: string | null; sort_order?: number }) => {
+     const previousParent = this.parent ?? null;
+-    if (previousParent === parentId) return;
++    const previousSortOrder = this.sort_order;
++    const parentChanged = data.parent !== undefined && (data.parent ?? null) !== previousParent;
++    const sortChanged = data.sort_order !== undefined && data.sort_order !== previousSortOrder;
++    if (!parentChanged && !sortChanged) return;
++    const nextParent = parentChanged ? (data.parent ?? null) : previousParent;
+     const pages = this.extendedStore.projectPages;
+     runInAction(() => {
+-      this.parent = parentId;
+-      if (previousParent) pages.getPageById(previousParent)?.adjustSubPagesCount(-1);
+-      if (parentId) pages.getPageById(parentId)?.adjustSubPagesCount(1);
++      if (parentChanged) {
++        this.parent = nextParent;
++        if (previousParent) pages.getPageById(previousParent)?.adjustSubPagesCount(-1);
++        if (nextParent) pages.getPageById(nextParent)?.adjustSubPagesCount(1);
++      }
++      if (sortChanged) this.sort_order = data.sort_order;
+     });
++    const payload: Partial<TPage> = {};
++    if (parentChanged) payload.parent = nextParent;
++    if (sortChanged) payload.sort_order = data.sort_order;
+     try {
+-      await this.extendedServices.update({ parent: parentId } as Partial<TPage>);
++      await this.extendedServices.update(payload);
+     } catch (error) {
+       runInAction(() => {
+-        this.parent = previousParent;
+-        if (previousParent) pages.getPageById(previousParent)?.adjustSubPagesCount(1);
+-        if (parentId) pages.getPageById(parentId)?.adjustSubPagesCount(-1);
++        if (parentChanged) {
++          this.parent = previousParent;
++          if (previousParent) pages.getPageById(previousParent)?.adjustSubPagesCount(1);
++          if (nextParent) pages.getPageById(nextParent)?.adjustSubPagesCount(-1);
++        }
++        if (sortChanged) this.sort_order = previousSortOrder;
+       });
+       throw error;
+     }
+diff --git a/apps/web/core/store/pages/project-page.store.ts b/apps/web/core/store/pages/project-page.store.ts
+index 0a86a6d99..53204bfe2 100644
+--- a/apps/web/core/store/pages/project-page.store.ts
++++ b/apps/web/core/store/pages/project-page.store.ts
+@@ -9,7 +9,7 @@ import { makeObservable, observable, runInAction, action, reaction, computed } f
+ import { computedFn } from "mobx-utils";
+ // types
+ import { EUserPermissions } from "@plane/constants";
+-import type { TPage, TPageFilters, TPageNavigationTabs } from "@plane/types";
++import type { InstructionType, TPage, TPageFilters, TPageNavigationTabs } from "@plane/types";
+ import { EUserProjectRoles } from "@plane/types";
+ // helpers
+ import { filterPagesByPageType, getPageName, orderPages, shouldFilterPage } from "@plane/utils";
+@@ -51,6 +51,7 @@ export interface IProjectPageStore {
+   getChildPageIdsByTab: (parentId: string, pageType: TPageNavigationTabs) => string[];
+   getPageAncestorIds: (pageId: string) => string[];
+   getPageDescendantIds: (pageId: string) => string[];
++  getManualOrderedChildIds: (parentId: string | null, projectId: string) => string[];
+   getPageById: (pageId: string) => TProjectPage | undefined;
+   updateFilters: <T extends keyof TPageFilters>(filterKey: T, filterValue: TPageFilters[T]) => void;
+   clearAllFilters: () => void;
+@@ -69,8 +70,15 @@ export interface IProjectPageStore {
+   createPage: (pageData: Partial<TPage>) => Promise<TPage | undefined>;
+   removePage: (params: { pageId: string; shouldSync?: boolean }) => Promise<void>;
+   movePage: (workspaceSlug: string, projectId: string, pageId: string, newProjectId: string) => Promise<void>;
++  reorderPage: (params: {
++    sourceId: string;
++    targetId: string;
++    instruction: InstructionType;
++  }) => Promise<void>;
+ }
+ 
++const SORT_ORDER_GAP = 10000;
++
+ export class ProjectPageStore implements IProjectPageStore {
+   // observables
+   loader: TLoader = "init-loader";
+@@ -78,8 +86,8 @@ export class ProjectPageStore implements IProjectPageStore {
+   error: TError | undefined = undefined;
+   filters: TPageFilters = {
+     searchQuery: "",
+-    sortKey: "updated_at",
+-    sortBy: "desc",
++    sortKey: "sort_order",
++    sortBy: "asc",
+   };
+   // service
+   service: ProjectPageService;
+@@ -104,6 +112,7 @@ export class ProjectPageStore implements IProjectPageStore {
+       createPage: action,
+       removePage: action,
+       movePage: action,
++      reorderPage: action,
+     });
+     this.rootStore = store;
+     // service
+@@ -249,6 +258,18 @@ export class ProjectPageStore implements IProjectPageStore {
+     return result;
+   });
+ 
++  /**
++   * @description non-archived children of a parent (null = top level) in manual order, regardless of tab/filters
++   * @param {string | null} parentId
++   * @param {string} projectId
++   */
++  getManualOrderedChildIds = computedFn((parentId: string | null, projectId: string) => {
++    const siblings = Object.values(this.data ?? {}).filter(
++      (p) => !!p.id && !p.archived_at && (p.parent ?? null) === parentId && p.project_ids?.includes(projectId)
++    );
++    return orderPages(siblings, "sort_order", "asc").map((p) => p.id as string);
++  });
++
+   /**
+    * @description get the page store by id
+    * @param {string} pageId
+@@ -371,6 +392,13 @@ export class ProjectPageStore implements IProjectPageStore {
+         this.error = undefined;
+       });
+ 
++      // place the new page after its siblings in manual order
++      if (pageData.sort_order === undefined) {
++        const siblingIds = this.getManualOrderedChildIds(pageData.parent ?? null, projectId);
++        const last = siblingIds.length ? this.getPageById(siblingIds[siblingIds.length - 1]) : undefined;
++        pageData = { ...pageData, sort_order: (last?.sort_order ?? 0) + SORT_ORDER_GAP };
++      }
++
+       const page = await this.service.create(workspaceSlug, projectId, pageData);
+       runInAction(() => {
+         if (page?.id) set(this.data, [page.id], new ProjectPage(this.store, page));
+@@ -423,6 +451,73 @@ export class ProjectPageStore implements IProjectPageStore {
+     }
+   };
+ 
++  /**
++   * @description drag-and-drop handler: nest `source` under `target` (make-child) or place it
++   * directly above/below `target` among the target's siblings. Persists parent and sort_order.
++   */
++  reorderPage = async ({
++    sourceId,
++    targetId,
++    instruction,
++  }: {
++    sourceId: string;
++    targetId: string;
++    instruction: InstructionType;
++  }) => {
++    const source = this.getPageById(sourceId);
++    const target = this.getPageById(targetId);
++    const projectId = this.store.router.projectId ?? source?.project_ids?.[0];
++    if (!projectId || !source || !target || sourceId === targetId) return;
++    // pages can only be nested within the same project
++    if (!target.project_ids?.includes(projectId) || !source.project_ids?.includes(projectId)) return;
++    // never nest a page inside its own subtree
++    if (this.getPageDescendantIds(sourceId).includes(targetId)) return;
++
++    const newParentId = instruction === "make-child" ? targetId : (target.parent ?? null);
++    const siblingIds = this.getManualOrderedChildIds(newParentId, projectId).filter((id) => id !== sourceId);
++
++    // desired final order of the siblings including the source
++    let insertAt = siblingIds.length;
++    if (instruction !== "make-child") {
++      const targetIndex = siblingIds.indexOf(targetId);
++      insertAt = targetIndex < 0 ? siblingIds.length : instruction === "reorder-above" ? targetIndex : targetIndex + 1;
++    }
++    const ordered = [...siblingIds.slice(0, insertAt), sourceId, ...siblingIds.slice(insertAt)];
++
++    const getSort = (id: string) => this.getPageById(id)?.sort_order;
++    const prev = insertAt > 0 ? getSort(ordered[insertAt - 1]) : undefined;
++    const next = insertAt < ordered.length - 1 ? getSort(ordered[insertAt + 1]) : undefined;
++
++    let newSortOrder: number | undefined;
++    if (prev === undefined && next === undefined) newSortOrder = source.sort_order ?? SORT_ORDER_GAP;
++    else if (prev === undefined && next !== undefined) newSortOrder = next - SORT_ORDER_GAP;
++    else if (next === undefined && prev !== undefined) newSortOrder = prev + SORT_ORDER_GAP;
++    else if (prev !== undefined && next !== undefined && next - prev > 1) newSortOrder = (prev + next) / 2;
++
++    // manual order should be what the user sees after dropping
++    if (this.filters.sortKey !== "sort_order") this.updateFilters("sortKey", "sort_order");
++    if (this.filters.sortBy !== "asc") this.updateFilters("sortBy", "asc");
++
++    if (newSortOrder !== undefined) {
++      await source.updateHierarchy({ parent: newParentId, sort_order: newSortOrder });
++      return;
++    }
++    // neighbours are tied or too close (e.g. all still on the default value): renormalise the whole sibling list.
++    // Locked siblings can't be PATCHed (server returns 400), so leave them where they are.
++    const results = await Promise.allSettled(
++      ordered.map((id, index) => {
++        const page = this.getPageById(id);
++        if (!page || (page.is_locked && id !== sourceId)) return Promise.resolve();
++        const desired = (index + 1) * SORT_ORDER_GAP;
++        return page.updateHierarchy(
++          id === sourceId ? { parent: newParentId, sort_order: desired } : { sort_order: desired }
++        );
++      })
++    );
++    const sourceResult = results[ordered.indexOf(sourceId)];
++    if (sourceResult && sourceResult.status === "rejected") throw sourceResult.reason;
++  };
++
+   /**
+    * @description move a page to a new project
+    * @param {string} workspaceSlug
+diff --git a/packages/i18n/src/locales/en/page.json b/packages/i18n/src/locales/en/page.json
+index f14a4b017..02b2e7df4 100644
+--- a/packages/i18n/src/locales/en/page.json
++++ b/packages/i18n/src/locales/en/page.json
+@@ -26,6 +26,14 @@
+           "highlight_changes": "Highlight changes"
+         }
+       },
++      "sub_pages": {
++        "label": "Sub-pages",
++        "add_button": "Add sub-page",
++        "empty_state": {
++          "title": "No sub-pages yet",
++          "description": "Break this page into smaller pages. They'll show up nested under it."
++        }
++      },
+       "assets": {
+         "label": "Assets",
+         "download_button": "Download",
+diff --git a/packages/types/src/page/core.ts b/packages/types/src/page/core.ts
+index 4677b2972..15c5695fb 100644
+--- a/packages/types/src/page/core.ts
++++ b/packages/types/src/page/core.ts
+@@ -33,7 +33,7 @@ export type TPage = {
+ // page filters
+ export type TPageNavigationTabs = "public" | "private" | "archived";
+ 
+-export type TPageFiltersSortKey = "name" | "created_at" | "updated_at" | "opened_at";
++export type TPageFiltersSortKey = "name" | "created_at" | "updated_at" | "opened_at" | "sort_order";
+ 
+ export type TPageFiltersSortBy = "asc" | "desc";
+ 
+diff --git a/packages/utils/src/page.ts b/packages/utils/src/page.ts
+index b566c5b6d..746ef023f 100644
+--- a/packages/utils/src/page.ts
++++ b/packages/utils/src/page.ts
+@@ -58,6 +58,15 @@ export const orderPages = (
+     orderedPages = sortBy(pages, [(m) => m.updated_at]);
+     if (sortByOrder === "desc") orderedPages = orderedPages.reverse();
+   }
++  if (sortByKey === "sort_order") {
++    // manual order (drag and drop); pages that were never moved share the default
++    // sort_order, so fall back to newest-first among them
++    orderedPages = sortBy(pages, [
++      (m) => m.sort_order ?? 0,
++      (m) => -(m.created_at ? new Date(m.created_at as unknown as string).getTime() : 0),
++    ]);
++    if (sortByOrder === "desc") orderedPages = orderedPages.reverse();
++  }
+ 
+   return orderedPages;
+ };
+-- 
+2.43.0
+
+
+From 8783ace72c12eefe1e16caea20f0c93d637cd51d Mon Sep 17 00:00:00 2001
+From: Kartheek Nagasuri <kartheek@artiumacademy.com>
+Date: Tue, 3 Nov 2026 09:30:10 +0000
+Subject: [PATCH 5/7] feat(pages): page actions menu on sidebar tree rows
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01CiiWKDVmCA9t6snJ82jWR1
+---
+ .../workspace/sidebar/project-pages-tree.tsx  | 36 +++++++++++++++----
+ 1 file changed, 30 insertions(+), 6 deletions(-)
+
+diff --git a/apps/web/core/components/workspace/sidebar/project-pages-tree.tsx b/apps/web/core/components/workspace/sidebar/project-pages-tree.tsx
+index a51f84e13..9e887699c 100644
+--- a/apps/web/core/components/workspace/sidebar/project-pages-tree.tsx
++++ b/apps/web/core/components/workspace/sidebar/project-pages-tree.tsx
+@@ -17,6 +17,7 @@ import { ChevronRightIcon, PageIcon } from "@plane/propel/icons";
+ import { TOAST_TYPE, setToast } from "@plane/propel/toast";
+ import { cn, getPageName, orderPages } from "@plane/utils";
+ // components
++import { PageActions } from "@/components/pages/dropdowns";
+ import { SidebarNavItem } from "@/components/sidebar/sidebar-navigation";
+ // hooks
+ import { EPageStoreType, usePageStore } from "@/hooks/store";
+@@ -130,9 +131,13 @@ export const ProjectPagesTree = observer(function ProjectPagesTree(props: Props)
+           canAccept={(sourceId) => sourceId !== id && !getPageDescendantIds(sourceId).includes(id)}
+           onDropPage={(sourceId) => handleDropOn(sourceId, id)}
+         >
+-        <Link href={`/${workspaceSlug}/projects/${projectId}/pages/${id}`} onClick={onNavigate}>
+-          <SidebarNavItem isActive={isActive} className="py-0.5">
+-            <div className="flex w-full items-center gap-1 truncate" style={{ paddingLeft: depth * INDENT_PX }}>
++        <SidebarNavItem isActive={isActive} className="py-0.5 pr-1">
++          <Link
++            href={`/${workspaceSlug}/projects/${projectId}/pages/${id}`}
++            onClick={onNavigate}
++            className="flex min-w-0 flex-1 items-center gap-1 truncate"
++            style={{ paddingLeft: depth * INDENT_PX }}
++          >
+               {hasChildren ? (
+                 <button
+                   type="button"
+@@ -155,9 +160,28 @@ export const ProjectPagesTree = observer(function ProjectPagesTree(props: Props)
+                 <PageIcon className="size-3.5 flex-shrink-0 text-tertiary" />
+               )}
+               <span className="truncate text-11">{getPageName(page.name)}</span>
+-            </div>
+-          </SidebarNavItem>
+-        </Link>
++          </Link>
++          <span
++            className="flex flex-shrink-0 items-center opacity-0 group-hover:opacity-100 focus-within:opacity-100"
++            onClick={(e) => e.stopPropagation()}
++          >
++            <PageActions
++              optionsOrder={[
++                "add-sub-page",
++                "move-to-page",
++                "open-in-new-tab",
++                "copy-link",
++                "make-a-copy",
++                "toggle-lock",
++                "toggle-access",
++                "archive-restore",
++                "delete",
++              ]}
++              page={page}
++              storeType={EPageStoreType.PROJECT}
++            />
++          </span>
++        </SidebarNavItem>
+         </SidebarPageRow>
+         {hasChildren && isExpanded && depth < MAX_DEPTH && children.map((childId) => renderNode(childId, depth + 1))}
+       </div>
+-- 
+2.43.0
+
+
+From 8c6cb7b2bda4680822f0d728b39d5952fa01d0b9 Mon Sep 17 00:00:00 2001
+From: Kartheek Nagasuri <kartheek@artiumacademy.com>
+Date: Tue, 3 Nov 2026 09:32:46 +0000
+Subject: [PATCH 6/7] feat(pages): reorder by drag-and-drop in the sidebar page
+ tree
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01CiiWKDVmCA9t6snJ82jWR1
+---
+ .../workspace/sidebar/project-pages-tree.tsx  | 80 ++++++++++++++-----
+ 1 file changed, 60 insertions(+), 20 deletions(-)
+
+diff --git a/apps/web/core/components/workspace/sidebar/project-pages-tree.tsx b/apps/web/core/components/workspace/sidebar/project-pages-tree.tsx
+index 9e887699c..4e7081df1 100644
+--- a/apps/web/core/components/workspace/sidebar/project-pages-tree.tsx
++++ b/apps/web/core/components/workspace/sidebar/project-pages-tree.tsx
+@@ -8,6 +8,7 @@ import { useEffect, useRef, useState } from "react";
+ import { observer } from "mobx-react";
+ import { combine } from "@atlaskit/pragmatic-drag-and-drop/combine";
+ import { draggable, dropTargetForElements } from "@atlaskit/pragmatic-drag-and-drop/element/adapter";
++import { attachInstruction, extractInstruction } from "@atlaskit/pragmatic-drag-and-drop-hitbox/tree-item";
+ import Link from "next/link";
+ import { useParams } from "next/navigation";
+ import useSWR from "swr";
+@@ -15,6 +16,8 @@ import useSWR from "swr";
+ import { Logo } from "@plane/propel/emoji-icon-picker";
+ import { ChevronRightIcon, PageIcon } from "@plane/propel/icons";
+ import { TOAST_TYPE, setToast } from "@plane/propel/toast";
++import type { InstructionType } from "@plane/types";
++import { DropIndicator } from "@plane/ui";
+ import { cn, getPageName, orderPages } from "@plane/utils";
+ // components
+ import { PageActions } from "@/components/pages/dropdowns";
+@@ -102,9 +105,9 @@ export const ProjectPagesTree = observer(function ProjectPagesTree(props: Props)
+       return next;
+     });
+ 
+-  const handleDropOn = async (sourceId: string, targetId: string) => {
++  const handleDrop = async (sourceId: string, targetId: string, instruction: InstructionType) => {
+     try {
+-      await reorderPage({ sourceId, targetId, instruction: "make-child" });
++      await reorderPage({ sourceId, targetId, instruction });
+     } catch (error) {
+       setToast({
+         type: TOAST_TYPE.ERROR,
+@@ -114,7 +117,7 @@ export const ProjectPagesTree = observer(function ProjectPagesTree(props: Props)
+     }
+   };
+ 
+-  const renderNode = (id: string, depth: number): React.ReactNode => {
++  const renderNode = (id: string, depth: number, isLastChild: boolean): React.ReactNode => {
+     const page = getPageById(id);
+     if (!page) return null;
+     const children = childrenOf[id] ?? [];
+@@ -127,9 +130,12 @@ export const ProjectPagesTree = observer(function ProjectPagesTree(props: Props)
+           pageId={id}
+           parentId={page.parent ?? null}
+           projectId={projectId}
++          depth={depth}
++          isExpandedGroup={hasChildren && isExpanded}
++          isLastChild={isLastChild}
+           isDragEnabled={canCurrentUserCreatePage && !page.is_locked}
+           canAccept={(sourceId) => sourceId !== id && !getPageDescendantIds(sourceId).includes(id)}
+-          onDropPage={(sourceId) => handleDropOn(sourceId, id)}
++          onDropPage={(sourceId, instruction) => handleDrop(sourceId, id, instruction)}
+         >
+         <SidebarNavItem isActive={isActive} className="py-0.5 pr-1">
+           <Link
+@@ -183,22 +189,32 @@ export const ProjectPagesTree = observer(function ProjectPagesTree(props: Props)
+           </span>
+         </SidebarNavItem>
+         </SidebarPageRow>
+-        {hasChildren && isExpanded && depth < MAX_DEPTH && children.map((childId) => renderNode(childId, depth + 1))}
++        {hasChildren &&
++          isExpanded &&
++          depth < MAX_DEPTH &&
++          children.map((childId, index) => renderNode(childId, depth + 1, index === children.length - 1))}
+       </div>
+     );
+   };
+ 
+   if (rootIds.length === 0) return null;
+-  return <div className="ml-3 flex flex-col border-l border-subtle pl-1">{rootIds.map((id) => renderNode(id, 0))}</div>;
++  return (
++    <div className="ml-3 flex flex-col border-l border-subtle pl-1">
++      {rootIds.map((id, index) => renderNode(id, 0, index === rootIds.length - 1))}
++    </div>
++  );
+ });
+ 
+ type TSidebarPageRowProps = {
+   pageId: string;
+   parentId: string | null;
+   projectId: string;
++  depth: number;
++  isExpandedGroup: boolean;
++  isLastChild: boolean;
+   isDragEnabled: boolean;
+   canAccept: (sourceId: string) => boolean;
+-  onDropPage: (sourceId: string) => void;
++  onDropPage: (sourceId: string, instruction: InstructionType) => void;
+   children: React.ReactNode;
+ };
+ 
+@@ -206,10 +222,11 @@ type TSidebarPageRowProps = {
+  * Wraps a sidebar page row so it can be dragged and can accept a page dropped onto it (nesting).
+  */
+ function SidebarPageRow(props: TSidebarPageRowProps) {
+-  const { pageId, parentId, projectId, isDragEnabled, canAccept, onDropPage, children } = props;
++  const { pageId, parentId, projectId, depth, isExpandedGroup, isLastChild, isDragEnabled, canAccept, onDropPage, children } =
++    props;
+   const ref = useRef<HTMLDivElement>(null);
+   const [isDragging, setIsDragging] = useState(false);
+-  const [isOver, setIsOver] = useState(false);
++  const [instruction, setInstruction] = useState<InstructionType | undefined>(undefined);
+   // keep latest callbacks without re-registering the drag handlers on every render
+   const callbacks = useRef({ canAccept, onDropPage });
+   callbacks.current = { canAccept, onDropPage };
+@@ -232,22 +249,45 @@ function SidebarPageRow(props: TSidebarPageRowProps) {
+           source.data.type === PAGE_DND_TYPE &&
+           source.data.projectId === projectId &&
+           callbacks.current.canAccept(source.data.id as string),
+-        onDragEnter: () => setIsOver(true),
+-        onDragLeave: () => setIsOver(false),
+-        onDrop: ({ source }) => {
+-          setIsOver(false);
+-          callbacks.current.onDropPage(source.data.id as string);
++        getData: ({ input, element: el }) =>
++          attachInstruction(
++            { id: pageId, type: PAGE_DND_TYPE, parentId, projectId },
++            {
++              input,
++              element: el,
++              currentLevel: depth,
++              indentPerLevel: INDENT_PX,
++              mode: isExpandedGroup ? "expanded" : isLastChild ? "last-in-group" : "standard",
++            }
++          ),
++        onDrag: ({ self }) => {
++          const next = extractInstruction(self.data)?.type;
++          setInstruction(next === "instruction-blocked" || next === "reparent" ? undefined : next);
++        },
++        onDragLeave: () => setInstruction(undefined),
++        onDrop: ({ self, source }) => {
++          setInstruction(undefined);
++          const type = extractInstruction(self.data)?.type;
++          if (!type || type === "instruction-blocked" || type === "reparent") return;
++          callbacks.current.onDropPage(source.data.id as string, type);
+         },
+       })
+     );
+-  }, [pageId, parentId, projectId, isDragEnabled]);
++  }, [pageId, parentId, projectId, depth, isExpandedGroup, isLastChild, isDragEnabled]);
+ 
+   return (
+-    <div
+-      ref={ref}
+-      className={cn("rounded-md", { "opacity-50": isDragging, "ring-1 ring-accent-strong": isOver })}
+-    >
+-      {children}
++    <div className="relative">
++      <DropIndicator isVisible={instruction === "reorder-above"} />
++      <div
++        ref={ref}
++        className={cn("rounded-md", {
++          "opacity-50": isDragging,
++          "ring-1 ring-accent-strong": instruction === "make-child",
++        })}
++      >
++        {children}
++      </div>
++      <DropIndicator isVisible={instruction === "reorder-below"} />
+     </div>
+   );
+ }
+-- 
+2.43.0
+
+
+From 43353bc647f6a2bd8a3264e85624ec1eced2b94a Mon Sep 17 00:00:00 2001
+From: Kartheek Nagasuri <kartheek@artiumacademy.com>
+Date: Tue, 3 Nov 2026 09:44:00 +0000
+Subject: [PATCH 7/7] fix(pages): make sidebar tree rows draggable by disabling
+ native link drag
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01CiiWKDVmCA9t6snJ82jWR1
+---
+ .../core/components/workspace/sidebar/project-pages-tree.tsx    | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/apps/web/core/components/workspace/sidebar/project-pages-tree.tsx b/apps/web/core/components/workspace/sidebar/project-pages-tree.tsx
+index 4e7081df1..6aa376fde 100644
+--- a/apps/web/core/components/workspace/sidebar/project-pages-tree.tsx
++++ b/apps/web/core/components/workspace/sidebar/project-pages-tree.tsx
+@@ -141,6 +141,8 @@ export const ProjectPagesTree = observer(function ProjectPagesTree(props: Props)
+           <Link
+             href={`/${workspaceSlug}/projects/${projectId}/pages/${id}`}
+             onClick={onNavigate}
++            // anchors are draggable by default and would swallow the drag; the row wrapper is the draggable
++            draggable={false}
+             className="flex min-w-0 flex-1 items-center gap-1 truncate"
+             style={{ paddingLeft: depth * INDENT_PX }}
+           >
+-- 
+2.43.0
+
